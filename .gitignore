@@ -216,3 +216,36 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Build output
+build_tmp/
+build_gpu_tmp/
+build/
+dist/
+*.spec
+*.exe
+_internal/
+_internal_gpu/
+
+# Data
+*.mp3
+*.wav
+*.flac
+
+# Docs
+docs/
+
+# Local / editor
+.claude/settings.local.json
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Custom
+input*/
+output*/
+presets/
+history.json
+venv_activate.bat
