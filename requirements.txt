@@ -1,4 +1,4 @@
-soundfile
+soundfile>=0.13
 numpy
 scipy
 PyQt6

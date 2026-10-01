@@ -6,13 +6,17 @@ narrow high-frequency tones these generators leave behind (removed with
 notches), plus optional softening of the harsh top band (a high shelf).
 """
 
+import os
 import re
 import sys
 import json
+import pickle
+import hashlib
 import shutil
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields, asdict, replace
 from datetime import datetime
@@ -37,6 +41,11 @@ def _preload_torch_dll():
 
 _preload_torch_dll()
 
+# The process is already per-monitor DPI aware before Qt starts, so Qt's own
+# SetProcessDpiAwarenessContext() call is refused and logs a harmless warning.
+os.environ['QT_LOGGING_RULES'] = ';'.join(
+    filter(None, [os.environ.get('QT_LOGGING_RULES'), 'qt.qpa.window=false']))
+
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -52,16 +61,16 @@ from PyQt6.QtWidgets import (
     QHeaderView, QAbstractItemView, QScrollArea, QSplitter,
     QGridLayout, QButtonGroup, QProgressBar, QRadioButton, QStackedWidget, QInputDialog,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QSettings, QEvent
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QSettings, QEvent, QObject, QPoint
 from PyQt6.QtGui import (QShortcut, QKeySequence, QColor, QIcon, QPixmap, QPainter,
-                         QPolygonF, QCursor)
+                         QPolygonF, QCursor, QFont, QTextDocument)
 from PyQt6.QtCore import QPointF, QRectF
 
 import matplotlib
 matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from matplotlib.ticker import FuncFormatter
+from matplotlib.ticker import FuncFormatter, LogFormatter
 
 
 # ──────────────────────────────────────────────────────────────
@@ -76,11 +85,12 @@ QMainWindow, QWidget {
     font-size: 12px;
 }
 QToolTip {
-    background-color: #313244; color: #cdd6f4;
-    border: 1px solid #45475a; padding: 4px;
+    background-color: #181825; color: #cdd6f4;
+    border: 1px solid #89b4fa; padding: 8px; font-size: 13px;
 }
 QListWidget {
     background-color: #181825;
+    alternate-background-color: #222235;
     border: 1px solid #313244;
     border-radius: 6px;
     color: #cdd6f4;
@@ -124,6 +134,7 @@ QPushButton#btn_primary { background-color: #89b4fa; color: #1e1e2e; font-weight
 QPushButton#btn_primary:hover { background-color: #b4befe; }
 QPushButton#btn_primary:disabled { background-color: #313244; color: #585b70; }
 QPushButton#btn_small { padding: 4px 8px; }
+QPushButton#btn_small:checked { background-color: #89b4fa; color: #1e1e2e; border-color: #89b4fa; }
 QPushButton#btn_link { background: transparent; border: none; color: #89b4fa; padding: 2px 0; text-align: left; }
 QPushButton#btn_link:hover { color: #b4befe; }
 
@@ -138,7 +149,12 @@ QPushButton#btn_ab_a   { background-color: #89b4fa; color: #1e1e2e; font-weight:
 QPushButton#btn_ab_b   { background-color: #a6e3a1; color: #1e1e2e; font-weight: bold; }
 QPushButton#btn_ab_c   { background-color: #45475a; color: #f9e2af; font-weight: bold; }
 QPushButton#btn_ab_c:checked { background-color: #f9e2af; color: #1e1e2e; }
-QPushButton#btn_ab_a:disabled, QPushButton#btn_ab_b:disabled, QPushButton#btn_ab_c:disabled {
+QPushButton#btn_ab_x   { background-color: #cba6f7; color: #1e1e2e; font-weight: bold; }
+QPushButton#btn_loop:checked { background-color: #89dceb; color: #1e1e2e; border-color: #89dceb; }
+QWidget#height_grip { background-color: #313244; border-radius: 2px; }
+QWidget#height_grip:hover { background-color: #585b70; }
+QPushButton#btn_ab_a:disabled, QPushButton#btn_ab_b:disabled, QPushButton#btn_ab_c:disabled,
+QPushButton#btn_ab_x:disabled {
     background-color: #1e1e2e; color: #585b70; border-color: #313244;
 }
 
@@ -235,7 +251,8 @@ C = {
     'bg':   '#1e1e2e', 'ax_bg': '#181825',
     'orig': '#89b4fa', 'proc':  '#a6e3a1', 'res': '#f9e2af',
     'fade': '#fab387', 'cut':   '#f38ba8', 'off': '#6c7086',
-    'grid': '#313244', 'text':  '#cdd6f4',
+    'grid': '#313244', 'text':  '#cdd6f4', 'cmp':   '#cba6f7',
+    'loop': '#89dceb',
 }
 
 
@@ -256,11 +273,14 @@ EXPORT_FORMATS = {
     'wav24':  ('WAV 24-bit',              '.wav',  'WAV',  'PCM_24'),
     'wav32f': ('WAV 32-bit float',        '.wav',  'WAV',  'FLOAT'),
     'flac24': ('FLAC 24-bit',             '.flac', 'FLAC', 'PCM_24'),
-    'same':   ('Same as input if lossless (MP3/OGG/M4A → FLAC 24-bit)', None, None, None),
+    'mp3':    ('MP3 320 kbps',            '.mp3',  'MP3',  'MPEG_LAYER_III'),
+    'same':   ('Same as input (OGG/M4A → FLAC 24-bit)', None, None, None),
 }
 
-# Only lossless containers are kept on "same as input"; lossy inputs are never re-encoded.
-_EXT_TO_SF_FORMAT = {'.wav': 'WAV', '.flac': 'FLAC', '.aiff': 'AIFF', '.aif': 'AIFF'}
+# Containers kept on "same as input" (soundfile format, subtype); others become FLAC 24-bit.
+_EXT_TO_SF_FORMAT = {'.wav': ('WAV', 'PCM_24'), '.flac': ('FLAC', 'PCM_24'),
+                     '.aiff': ('AIFF', 'PCM_24'), '.aif': ('AIFF', 'PCM_24'),
+                     '.mp3': ('MP3', 'MPEG_LAYER_III')}
 
 
 def _read_audio_ffmpeg(path: str) -> tuple[np.ndarray, int]:
@@ -302,9 +322,9 @@ def output_path(src: str, out_dir: Path, suffix: str, fmt_key: str) -> tuple[Pat
     p = Path(src)
     _, ext, fmt, subtype = EXPORT_FORMATS.get(fmt_key, EXPORT_FORMATS['wav24'])
     if ext is None:   # same as input
-        sf_fmt = _EXT_TO_SF_FORMAT.get(p.suffix.lower())
+        sf_fmt, sf_sub = _EXT_TO_SF_FORMAT.get(p.suffix.lower(), (None, None))
         if sf_fmt in sf.available_formats():
-            return out_dir / f'{p.stem}{suffix}{p.suffix}', sf_fmt, 'PCM_24'
+            return out_dir / f'{p.stem}{suffix}{p.suffix}', sf_fmt, sf_sub
         _, ext, fmt, subtype = EXPORT_FORMATS['flac24']
     return out_dir / f'{p.stem}{suffix}{ext}', fmt, subtype
 
@@ -312,6 +332,10 @@ def output_path(src: str, out_dir: Path, suffix: str, fmt_key: str) -> tuple[Pat
 def write_audio(path: Path, audio: np.ndarray, sr: int, fmt: str | None, subtype: str | None):
     if subtype != 'FLOAT':
         audio = np.clip(audio, -1.0, 1.0)
+    if fmt == 'MP3':   # constant bitrate at the highest setting (320 kbps)
+        sf.write(str(path), audio, sr, format=fmt, subtype=subtype,
+                 compression_level=0.0, bitrate_mode='CONSTANT')
+        return
     sf.write(str(path), audio, sr, format=fmt, subtype=subtype)
 
 
@@ -1138,9 +1162,15 @@ def _style_axes(ax):
     ax.set_facecolor(C['ax_bg'])
     for sp in ax.spines.values():
         sp.set_edgecolor(C['grid'])
-    ax.tick_params(colors=C['text'], labelsize=8)
+    ax.tick_params(which='both', colors=C['text'], labelsize=8)
     ax.xaxis.label.set_color(C['text'])
     ax.yaxis.label.set_color(C['text'])
+
+
+class _HzLogFormatter(LogFormatter):
+    """Log-axis labels as 400 / 4k instead of 4×10^2 / 4×10^3."""
+    def _num_to_string(self, x, vmin, vmax):
+        return f'{x / 1000:g}k' if x >= 1000 else f'{x:g}'
 
 
 class SpectrumCanvas(FigureCanvasQTAgg):
@@ -1168,6 +1198,7 @@ class SpectrumCanvas(FigureCanvasQTAgg):
         self.ax.grid(True, color=C['grid'], alpha=0.5, which='both', lw=0.5)
         self.ax.xaxis.set_major_formatter(FuncFormatter(
             lambda v, _: f'{v / 1000:g}k' if v >= 1000 else f'{v:g}'))
+        self.ax.xaxis.set_minor_formatter(_HzLogFormatter(labelOnlyBase=False))
         self.ax.set_title('Spectrum · LMB / RMB = move orange / red lines · Shift+click = add / remove tone · '
                           'scroll = zoom · dbl-click = full', color=C['text'], fontsize=9.5, pad=6)
 
@@ -1438,8 +1469,7 @@ class ToneCloseupCanvas(FigureCanvasQTAgg):
         super().__init__(self.fig)
         self.setParent(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setToolTip('Right-click = add a tone notch there · scroll = zoom · '
-                        'middle-drag = pan · double-click = reset')
+        self.setToolTip(TIPS['closeup'])
 
         self.ax = self.fig.add_subplot(111)
         _style_axes(self.ax)
@@ -1549,6 +1579,7 @@ class ToneCloseupCanvas(FigureCanvasQTAgg):
 
 class ToneLinesCanvas(FigureCanvasQTAgg):
     region_selected     = pyqtSignal(float, float)
+    loop_selected       = pyqtSignal(float, float)
     add_notch_requested = pyqtSignal(float)
     seek_requested      = pyqtSignal(float)
 
@@ -1566,8 +1597,7 @@ class ToneLinesCanvas(FigureCanvasQTAgg):
         super().__init__(self.fig)
         self.setParent(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setToolTip('Click = seek · drag = pick noise-profile region (adaptive mode) · '
-                        'right-click = add a tone notch there · scroll = zoom · double-click = reset')
+        self.setToolTip(TIPS['tonelines'])
 
         self.ax = self.fig.add_subplot(111)
         _style_axes(self.ax)
@@ -1582,8 +1612,10 @@ class ToneLinesCanvas(FigureCanvasQTAgg):
         self._default_ylim = (2.0, 22.05)
         self._overlay: list = []
         self._region_patch  = None
+        self._loop_art: list = []
         self._drag_patch    = None
         self._press = None
+        self.pick_loop = False   # next drag picks the loop section
 
         self._playhead = self.ax.axvline(0.0, color='#ffffff', lw=1.0, alpha=0.8, animated=True)
         self._bg = None
@@ -1663,6 +1695,21 @@ class ToneLinesCanvas(FigureCanvasQTAgg):
                                                  edgecolor=C['proc'], lw=1.2, zorder=3)
         self.draw_idle()
 
+    def set_loop(self, region: tuple | None):
+        for a in self._loop_art:
+            try:
+                a.remove()
+            except Exception:
+                pass
+        self._loop_art = []
+        if region:
+            t0, t1 = sorted(region)
+            self._loop_art.append(self.ax.axvspan(t0, t1, ymin=0.0, ymax=0.035, facecolor=C['loop'],
+                                                  alpha=0.9, lw=0, zorder=5))
+            for t in (t0, t1):
+                self._loop_art.append(self.ax.axvline(t, color=C['loop'], lw=1.2, alpha=0.9, zorder=5))
+        self.draw_idle()
+
     def set_playhead(self, t: float):
         self._playhead.set_xdata([t, t])
         if self._bg is None:
@@ -1689,26 +1736,28 @@ class ToneLinesCanvas(FigureCanvasQTAgg):
             self.draw_idle()
             return
         if event.button == 1:
-            self._press = (event.x, float(event.xdata))
+            loop = self.pick_loop or 'shift' in (event.key or '')
+            self._press = (event.x, float(event.xdata), loop)
         elif event.button == 3 and event.ydata is not None:
             self.add_notch_requested.emit(float(event.ydata) * 1000.0)
 
     def _on_motion(self, event):
         if self._press is None or event.xdata is None:
             return
-        x0_px, t0 = self._press
+        x0_px, t0, loop = self._press
         if abs(event.x - x0_px) < self.DRAG_PX:
             return
         if self._drag_patch is not None:
             self._drag_patch.remove()
         lo, hi = sorted((t0, float(event.xdata)))
-        self._drag_patch = self.ax.axvspan(lo, hi, facecolor=C['proc'], alpha=0.12, zorder=3)
+        self._drag_patch = self.ax.axvspan(lo, hi, facecolor=C['loop' if loop else 'proc'],
+                                           alpha=0.12, zorder=3)
         self.draw_idle()
 
     def _on_release(self, event):
         if self._press is None or event.button != 1:
             return
-        x0_px, t0 = self._press
+        x0_px, t0, loop = self._press
         self._press = None
         if self._drag_patch is not None:
             self._drag_patch.remove()
@@ -1721,7 +1770,7 @@ class ToneLinesCanvas(FigureCanvasQTAgg):
         else:
             a, b = sorted((float(np.clip(t0, t_lo, t_hi)), float(np.clip(t1, t_lo, t_hi))))
             if b - a > 0.05:
-                self.region_selected.emit(a, b)
+                (self.loop_selected if loop else self.region_selected).emit(a, b)
 
     def _on_scroll(self, event):
         if event.inaxes != self.ax or event.ydata is None or self._img is None:
@@ -1758,26 +1807,6 @@ class LoadWorker(QThread):
             f, p = proc.spectrum_original()
             self.done.emit({'sr': sr, 'path': self.path, 'processor': proc,
                             'spec_f': f, 'spec_p': p, 'generation': self.generation})
-        except Exception as e:
-            self.error.emit(str(e), self.generation)
-
-
-class RenderWorker(QThread):
-    """Renders a stored version (history entry) so it can be played as A."""
-    done  = pyqtSignal(object)
-    error = pyqtSignal(str, int)
-
-    def __init__(self, processor: FilterProcessor, settings: FilterSettings, generation: int, tag):
-        super().__init__()
-        self.processor  = processor
-        self.settings   = settings
-        self.generation = generation
-        self.tag        = tag
-
-    def run(self):
-        try:
-            _, audio = self.processor.clean(self.settings, detect=False)
-            self.done.emit({'audio': audio, 'generation': self.generation, 'tag': self.tag})
         except Exception as e:
             self.error.emit(str(e), self.generation)
 
@@ -1903,6 +1932,7 @@ class BatchDialog(QDialog):
         bt = QVBoxLayout(box_t.body)
         self.list_tracks = QListWidget()
         self.list_tracks.setMinimumHeight(140)
+        box_t.setToolTip(TIPS['b_tracks'])
         for path, name in tracks:
             it = QListWidgetItem(name)
             it.setData(Qt.ItemDataRole.UserRole, path)
@@ -1949,6 +1979,11 @@ class BatchDialog(QDialog):
         bs.addWidget(self.combo_user, 2, 1)
         for i, rb in enumerate((self.rb_current, self.rb_strength, self.rb_user)):
             self.src_group.addButton(rb, i)
+        self.rb_current.setToolTip(TIPS['b_current'])
+        for w in (self.rb_strength, self.combo_strength):
+            w.setToolTip(TIPS['b_strength'])
+        for w in (self.rb_user, self.combo_user):
+            w.setToolTip(TIPS['b_user'])
         bs.addWidget(_hint('Current = exactly what the panel shows now, including your own tweaks. '
                            'A strength or preset replaces the tone / top-band knobs; the Advanced '
                            'settings stay as they are.'), 3, 0, 1, 2)
@@ -1963,11 +1998,14 @@ class BatchDialog(QDialog):
         self.tone_group = QButtonGroup(self)
         self.tone_group.addButton(self.rb_detect, 0)
         self.tone_group.addButton(self.rb_list, 1)
+        self.rb_detect.setToolTip(TIPS['b_detect'])
+        self.rb_list.setToolTip(TIPS['b_list'])
         bn.addWidget(self.rb_detect)
         bn.addWidget(self.rb_list)
         self.chk_manual = QCheckBox(f'Tracks whose tone list you edited by hand keep that list '
                                     f'({n_manual} track{"s" if n_manual != 1 else ""})')
         self.chk_manual.setEnabled(n_manual > 0)
+        self.chk_manual.setToolTip(TIPS['b_manual'])
         bn.addWidget(self.chk_manual)
         lay.addWidget(box_n)
 
@@ -1976,6 +2014,7 @@ class BatchDialog(QDialog):
         bo = QFormLayout(box_o.body)
         dr = QHBoxLayout()
         self.edit_dir = QLineEdit(str(out_dir))
+        self.edit_dir.setToolTip(TIPS['b_folder'])
         dr.addWidget(self.edit_dir, stretch=1)
         b_browse = QPushButton('Browse…')
         b_browse.setObjectName('btn_small')
@@ -1986,12 +2025,21 @@ class BatchDialog(QDialog):
         for key, (label, *_rest) in EXPORT_FORMATS.items():
             self.combo_format.addItem(label, key)
         self.combo_format.setCurrentIndex(max(self.combo_format.findData(fmt_key), 0))
+        self.combo_format.setToolTip(TIPS['b_format'])
         bo.addRow('Format:', self.combo_format)
         self.edit_suffix = QLineEdit(suffix)
         self.edit_suffix.setPlaceholderText('_cleaned')
+        self.edit_suffix.setToolTip(TIPS['b_suffix'])
         bo.addRow('Name suffix:', self.edit_suffix)
         self.chk_removed = QCheckBox('Also save the removed part of each track (…_removed)')
+        self.chk_removed.setToolTip(TIPS['b_removed'])
         bo.addRow(self.chk_removed)
+        for i in range(bo.rowCount()):   # row labels share their field's tooltip
+            lab = bo.itemAt(i, QFormLayout.ItemRole.LabelRole)
+            fld = bo.itemAt(i, QFormLayout.ItemRole.FieldRole)
+            if lab and lab.widget() and fld:
+                w = fld.widget() or fld.layout().itemAt(0).widget()
+                lab.widget().setToolTip(w.toolTip())
         lay.addWidget(box_o)
 
         buttons = QDialogButtonBox(
@@ -2079,7 +2127,13 @@ class BatchDialog(QDialog):
 
 class SettingsDialog(QDialog):
 
-    def __init__(self, parent, suffix: str, fmt_key: str, detect_on_load: bool, use_gpu: bool):
+    HISTORY_LINES = [('head', 'Number, time and preset'), ('changes', 'What changed'),
+                     ('result', 'Result (tones, amount removed)')]
+    HISTORY_CLEAR = [('close', 'When the program closes'), ('track', 'When switching to another track'),
+                     ('keep', 'Never — keep every version')]
+
+    def __init__(self, parent, suffix: str, fmt_key: str, detect_on_load: bool, use_gpu: bool,
+                 history_lines: dict, history_clear: str):
         super().__init__(parent)
         self.setWindowTitle('Settings')
         self.setMinimumWidth(440)
@@ -2088,20 +2142,18 @@ class SettingsDialog(QDialog):
         form.setVerticalSpacing(10)
         self.edit_suffix = QLineEdit(suffix)
         self.edit_suffix.setPlaceholderText('_cleaned')
-        self.edit_suffix.setToolTip('Appended to the file name on Save / Save All. Leave empty for none.')
+        self.edit_suffix.setToolTip(TIPS['set_suffix'])
         form.addRow('Name suffix:', self.edit_suffix)
 
         self.combo_format = QComboBox()
         for key, (label, *_rest) in EXPORT_FORMATS.items():
             self.combo_format.addItem(label, key)
         self.combo_format.setCurrentIndex(max(self.combo_format.findData(fmt_key), 0))
-        self.combo_format.setToolTip(
-            'Lossless output avoids a second lossy generation (MP3 also low-passes near 16 kHz).')
+        self.combo_format.setToolTip(TIPS['set_format'])
         form.addRow('Output format:', self.combo_format)
 
         self.chk_detect = QCheckBox('Auto-detect AI tones for each track that is opened')
-        self.chk_detect.setToolTip('Off: every track uses the last tone list you had. '
-                                   'Press "Auto-detect tones" to find them for the current track.')
+        self.chk_detect.setToolTip(TIPS['set_detect'])
         self.chk_detect.setChecked(detect_on_load)
         form.addRow(self.chk_detect)
 
@@ -2110,9 +2162,26 @@ class SettingsDialog(QDialog):
                                  'Process on the GPU (needs PyTorch with CUDA)')
         self.chk_gpu.setChecked(use_gpu and bool(gpu))
         self.chk_gpu.setEnabled(bool(gpu))
-        self.chk_gpu.setToolTip('Runs the FFT work through PyTorch + CUDA — several times faster. '
-                                'Off: CPU (scipy).')
+        self.chk_gpu.setToolTip(TIPS['set_gpu'])
         form.addRow(self.chk_gpu)
+
+        lines = QVBoxLayout()
+        lines.setSpacing(4)
+        self.chk_lines = {}
+        for key, label in self.HISTORY_LINES:
+            chk = QCheckBox(label)
+            chk.setChecked(history_lines.get(key, True))
+            chk.setToolTip(TIPS['set_hist_lines'])
+            self.chk_lines[key] = chk
+            lines.addWidget(chk)
+        form.addRow('History lines:', lines)
+
+        self.combo_hist_clear = QComboBox()
+        for key, label in self.HISTORY_CLEAR:
+            self.combo_hist_clear.addItem(label, key)
+        self.combo_hist_clear.setCurrentIndex(max(self.combo_hist_clear.findData(history_clear), 0))
+        self.combo_hist_clear.setToolTip(TIPS['set_hist_clear'])
+        form.addRow('Clear history:', self.combo_hist_clear)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -2120,6 +2189,12 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         lay = QVBoxLayout(self)
+        for i in range(form.rowCount()):   # row labels share their field's tooltip
+            lab = form.itemAt(i, QFormLayout.ItemRole.LabelRole)
+            fld = form.itemAt(i, QFormLayout.ItemRole.FieldRole)
+            if lab and lab.widget() and fld:
+                w = fld.widget() or fld.layout().itemAt(0).widget()
+                lab.widget().setToolTip(w.toolTip())
         lay.addLayout(form)
         lay.addWidget(buttons)
 
@@ -2136,10 +2211,660 @@ class SettingsDialog(QDialog):
         """None when the GPU is unavailable (keep the stored preference)."""
         return self.chk_gpu.isChecked() if self.chk_gpu.isEnabled() else None
 
+    def history_lines(self) -> dict:
+        return {k: c.isChecked() for k, c in self.chk_lines.items()}
+
+    def history_clear(self) -> str:
+        return self.combo_hist_clear.currentData()
+
 
 # ──────────────────────────────────────────────────────────────
 #  MAIN WINDOW
 # ──────────────────────────────────────────────────────────────
+
+def _tip(title: str, *paras: str, items: tuple = ()) -> str:
+    """Tooltip body: bold title, paragraphs, then an aligned 'action → effect' list."""
+    html = f'<p style="margin:0; font-size:15px; font-weight:600; color:#89b4fa;">{title}</p>'
+    for p in paras:
+        if p:
+            html += f'<p style="margin:7px 0 0 0;">{p}</p>'
+    if items:
+        rows = ''.join(f'<tr><td style="color:#f9e2af; padding:2px 12px 2px 0;"><nobr>{k}</nobr></td>'
+                       f'<td style="padding:2px 0;">{v}</td></tr>' for k, v in items)
+        html += f'<table style="margin-top:7px;" cellspacing="0" cellpadding="0">{rows}</table>'
+    return html
+
+
+def _use(text: str) -> str:
+    return f'<span style="color:#a6e3a1; font-weight:600;">How to use:</span> {text}'
+
+
+AI_TONE_DEF = (
+    'An <b>AI tone</b> is a peak in the track\'s average spectrum that passes all four tests:'
+    '<br>• <b>Steady</b> — there for most of the track. The spectrum is the median over time, '
+    'so notes that come and go do not count.'
+    '<br>• <b>Narrow</b> — under 40 Hz wide at half height. Instruments and voices are wider.'
+    '<br>• <b>Stands out</b> — at least the <i>Sensitivity</i> amount (dB) above the median '
+    'level of the surrounding 600 Hz.'
+    '<br>• <b>High</b> — above <i>Search above</i> and below where the track\'s content ends.'
+    '<br>They sound like faint, constant whistles or a metallic shimmer over the whole song.')
+
+_CLR = {'blue': '#89b4fa', 'green': '#a6e3a1', 'red': '#f38ba8', 'orange': '#fab387',
+        'yellow': '#f9e2af', 'purple': '#cba6f7'}
+
+
+def _c(name: str, text: str) -> str:
+    return f'<span style="color:{_CLR[name]};">{text}</span>'
+
+
+TIPS = {
+    # ── Top bar / views ──────────────────────────────────────
+    'workflow': _tip(
+        'Workflow',
+        'Where you are in the job. ' + _c('green', 'Green ✔') + ' = done, ' + _c('yellow', 'yellow') +
+        ' = the step to do now, grey = still to come.',
+        _use('pick a track, wait for the first clean (a few seconds), listen with Tab and R, '
+             'adjust if needed, then Save.'),
+        items=(('1 · Pick', 'click a track in the list on the left'),
+               ('2 · Clean', 'runs by itself after loading and after every change you make'),
+               ('3 · Compare', 'Tab steps A original / B cleaned / C, D … · R plays only what is removed'),
+               ('4 · Save', 'Save writes the cleaned track to the output folder'))),
+    'spec_view': _tip(
+        'Spectrum view',
+        'Which frequency range the upper graph shows. The lit button is the range on screen; '
+        'after you zoom or pan by hand neither is lit.',
+        _use('stay on <b>AI tone band</b> while tuning tones; switch to <b>Full range</b> to check '
+             'that nothing in the bass or mids changed.')),
+    'zoom_full': _tip(
+        'Full range',
+        'Shows the whole spectrum, 20 Hz up to half the sample rate (the highest frequency the file '
+        'can hold).',
+        _use('check that the green (cleaned) line lies on top of the blue one everywhere except '
+             'where you meant to cut. Double-clicking the graph does the same.')),
+    'zoom_band': _tip(
+        'AI tone band (default)',
+        'Zooms to where AI tones live: from just below <i>Search above</i> up to where the track\'s '
+        'content ends. Every track opens in this view.',
+        _use('this is the working view — the tone spikes, the red notch ticks and the orange / red '
+             'top-band lines are all easy to see and grab here.')),
+    'colours': _tip(
+        'Colours',
+        'The same colours are used in every graph and on the A/B button.',
+        items=((_c('blue', 'Blue'), 'original track (A)'),
+               (_c('green', 'Green'), 'after cleaning (B)'),
+               (_c('red', 'Red fill'), 'what the cleaner removed'),
+               (_c('red', 'Red ticks'), 'notches in the tone list — one per AI tone'),
+               (_c('orange', 'Orange line'), 'top-band cut starts fading in'),
+               (_c('red', 'Red line'), 'top-band cut at full strength from here up'),
+               (_c('yellow', 'Yellow dashed'), 'Sensitivity threshold (Tone close-up)'))),
+    'spectrum': _tip(
+        'Spectrum',
+        'The average level of every frequency over the whole track: left = low (bass), right = high '
+        '(treble), up = louder. AI tones are the thin spikes above about 5 kHz. After cleaning, the '
+        + _c('green', 'green') + ' line should have those spikes flattened while following the '
+        + _c('blue', 'blue') + ' line everywhere else. Every change made here re-cleans straight away.',
+        '<b>What the lines do</b> (step 2, top band):'
+        '<br>• Below the ' + _c('orange', 'orange line') + ': not touched.'
+        '<br>• Orange → ' + _c('red', 'red line') + ': the cut fades in, shaped by <i>Curve</i>. '
+        'Lines far apart = gentle, gradual cut; close together = abrupt.'
+        '<br>• Above the red line: turned down by the full <i>Reduction</i> amount.'
+        '<br>• Orange line further left = more of the treble is softened; further right = only the '
+        'very top. Moving either line switches step 2 on.',
+        '<b>What the red ticks do</b> (step 1, AI tones):'
+        '<br>• Each tick is a notch that cuts one tone by the step 1 <i>Reduction</i>. Adding one '
+        'cuts that frequency (20 Hz wide); removing one leaves that tone in.',
+        _use('put the orange line where the sound turns harsh or hissy and the red line a few kHz '
+             'above it, then compare with Tab. Add a notch on any spike the detector missed.'),
+        items=(('Left click / drag', 'move the orange line'),
+               ('Right click / drag', 'move the red line'),
+               ('Shift + left', 'add a tone notch, or drag an existing one'),
+               ('Shift + right', 'remove the nearest tone notch'),
+               ('Scroll', 'zoom around the mouse'),
+               ('Middle drag', 'pan'),
+               ('Double-click', 'full range'))),
+    'pan': _tip(
+        'Pan',
+        'Slides the zoomed spectrum left or right without changing the zoom. Only active while '
+        'zoomed in.',
+        _use('drag the handle, or click anywhere on the bar to jump there.')),
+    'lower_view': _tip(
+        'Lower view',
+        'Chooses the graph under the spectrum. The lit button is the one on screen.',
+        items=(('Tone close-up', 'which tones were found and which are still there — use while tuning'),
+               ('Tone lines over time', 'where in the song the tones are — use to check by eye and to '
+                                        'pick a loop or noise-profile region'))),
+    'closeup': _tip(
+        'Tone close-up',
+        'How far each frequency stands above its own surroundings, in dB. Normal music sits around '
+        '0; every ' + _c('blue', 'blue') + ' spike is a steady AI tone. ' + _c('green', 'Green') +
+        ' is the same after cleaning. The ' + _c('yellow', 'yellow dashed line') + ' is the '
+        '<i>Sensitivity</i> threshold: a spike above it counts as an AI tone. ' + _c('red', 'Red ticks') +
+        ' along the bottom are the notches.',
+        _use('after cleaning, look for green spikes still above the yellow line — those tones are '
+             'still audible. Raise <i>Reduction</i>, raise <i>Sensitivity</i>, or right-click the '
+             'spike to notch it by hand.'),
+        items=(('Right click', 'add a tone notch at that frequency'),
+               ('Scroll', 'zoom'),
+               ('Middle drag', 'pan'),
+               ('Double-click', 'reset the zoom'))),
+    'tonelines': _tip(
+        'Tone lines over time',
+        'A spectrogram of the AI tone band: time runs left → right, frequency bottom → top, brighter '
+        '= stands out more above its surroundings. Steady AI tones show as bright horizontal lines '
+        'running through the whole song; music shows as short blobs and streaks.',
+        'It shows the original, the cleaned result or the removed part — whatever you are listening '
+        'to (A / B / Hear Removed). The white line is the playhead.',
+        _use('in B the horizontal lines should be gone while the music blobs stay. In Hear Removed '
+             'you should see mostly lines, not music.'),
+        items=(('Click', 'jump playback there'),
+               ('Drag', 'pick the noise-profile region (Adaptive method)'),
+               ('Shift + drag', 'pick the loop section'),
+               ('Right click', 'add a tone notch at that frequency'),
+               ('Scroll', 'zoom'),
+               ('Double-click', 'reset the zoom'))),
+
+    # ── Tracks ──────────────────────────────────────────────
+    'tracks': _tip(
+        'Tracks',
+        'Audio files from the input folder plus any you add or drop on the window. MP3, WAV, FLAC, '
+        'OGG, AIFF, M4A, MP4, AAC and Opus are supported.',
+        _use('click a track to load it. It is analysed, its AI tones are found and a first clean '
+             'is made automatically. Hover a track for its full path.')),
+    'loaded_track': _tip(
+        'Loaded track',
+        'Name, length, sample rate, number of channels, and the frequency where the track\'s content '
+        'ends. AI generators and MP3 encoders usually stop at 16–20 kHz; nothing above that is '
+        'touched.'),
+    'add_files': _tip(
+        'Add files',
+        'Adds audio files to the track list.',
+        _use('pick one or more files. Dragging files onto the window does the same.')),
+
+    # ── Transport ───────────────────────────────────────────
+    'position': _tip(
+        'Position',
+        'Where playback is in the track.',
+        _use('click or drag anywhere on the bar to jump. ◀ / ▶ keys skip 5 seconds. Switching '
+             'A / B keeps the position, so you can compare the same moment.')),
+    'play': _tip(
+        'Play / Pause',
+        'Plays whatever the A/B button shows: original, cleaned, a compared version, or only the '
+        'removed part.',
+        items=(('Space', 'play / pause'),)),
+    'stop': _tip('Stop', 'Stops playback and goes back to the start of the track.'),
+    'ab': _tip(
+        'A / B comparison',
+        'Chooses what you hear and what the graphs show. Switching keeps playing at the same spot, '
+        'so even small differences are easy to hear. The frame around the graphs takes the same colour.',
+        _use('play a passage with clear high-end (cymbals, vocals \'s\' sounds) and press Tab back and '
+             'forth. B should lose the whistle / shimmer but keep the same brightness and detail. If '
+             'B sounds dull, the top-band cut is too strong.'),
+        items=(('<span style="color:#89b4fa;">A</span>', 'original'),
+               ('<span style="color:#a6e3a1;">B</span>', 'cleaned — the version picked in History'),
+               ('<span style="color:#cba6f7;">C, D …</span>', 'older versions added with Add to comparison'),
+               ('Tab', 'step to the next one'))),
+    'solo': _tip(
+        'Hear Removed',
+        'Plays only what the cleaner takes out (original minus cleaned), turned up so it is audible. '
+        'The frame turns yellow.',
+        _use('it should sound like thin whistles and hiss. If you can hear the melody, drums or '
+             'vocals clearly, too much is being removed: lower the step 2 <i>Reduction</i>, move the '
+             'orange line right, or lower <i>Sensitivity</i>.'),
+        items=(('R', 'on / off'), ('Tab', 'back to normal listening'))),
+    'loop': _tip(
+        'Loop',
+        'Repeats the track, or only the loop section when one is set.',
+        _use('loop a short revealing passage and keep tweaking — every change re-cleans and you hear '
+             'it on the next pass.'),
+        items=(('L', 'on / off'),)),
+    'loop_sec': _tip(
+        'Loop Section',
+        'Sets a part of the track to repeat.',
+        _use('click it, then drag across the Tone lines view over the part you want. Click again to '
+             'clear the section. Shift + drag in the Tone lines view works any time.')),
+    'keys': _tip(
+        'Keyboard',
+        'Shortcuts that work anywhere in the window.',
+        items=(('Space', 'play / pause'), ('Tab', 'step A / B / C …'),
+               ('R', 'hear only what is removed'), ('L', 'loop on / off'),
+               ('◀ / ▶', 'skip 5 seconds back / forward'),
+               ('Ctrl+Z / Ctrl+Y', 'settings one step back / forward in History'))),
+    'volume': _tip(
+        'Volume',
+        'Playback level only. It does not change the cleaned result or the saved file.',
+        _use('click or drag anywhere on the bar.')),
+
+    # ── Strength ────────────────────────────────────────────
+    'strength': _tip(
+        'Cleaning strength',
+        'Ready-made settings for steps 1 and 2 together. Changing any of those controls afterwards '
+        'turns the preset into <i>Custom</i>. Advanced settings are not changed by a preset.',
+        _use('start with <b>Normal</b>. Go <b>Gentle</b> if B sounds duller than A; go <b>Strong</b> '
+             'if whistles are still audible.'),
+        items=(('Gentle', PRESETS['gentle']['text']), ('Normal', PRESETS['normal']['text']),
+               ('Strong', PRESETS['strong']['text']))),
+    'user_presets': _tip(
+        'Your presets',
+        'Settings you saved with <i>Save as…</i>, including the Advanced ones.',
+        _use('pick one to load all its settings; the track is re-cleaned with them.')),
+    'preset_save': _tip(
+        'Save as…',
+        'Saves every current setting (both steps and Advanced) under a name of your choice.',
+        _use('save a setup that works for one AI generator or style, and reuse it on the next '
+             'tracks or in Save All.')),
+    'preset_del': _tip('Delete', 'Deletes the preset picked on the left. This cannot be undone.'),
+
+    # ── Result ──────────────────────────────────────────────
+    'result': _tip(
+        'Result',
+        'Numbers for the version you are listening to. ' + _c('green', 'Green') + ' = good, '
+        + _c('yellow', 'yellow') + ' = check by ear, ' + _c('red', 'red') + ' = too little or too much '
+        'removed. Hover each line for details.',
+        _use('aim for most tones gone, a small energy figure and “mostly tones”. Your ears decide — '
+             'the numbers only warn you.'),
+        items=(('AI tones', 'tones found in the original → tones still there after cleaning'),
+               ('Energy removed', 'how much of the track\'s total energy was taken out'),
+               ('Removed sound is', 'whether the removed part is tones (good) or music (too much)'))),
+    'tones_count': _tip(
+        'AI tones found → left',
+        AI_TONE_DEF,
+        '<b>Found</b> = peaks in the original that pass the test. <b>Left</b> = peaks in the cleaned '
+        'track that still pass it, measured against the original\'s surroundings so a notch\'s dip '
+        'cannot hide a tone.',
+        _c('green', 'Green') + ' = almost all gone · ' + _c('yellow', 'yellow') + ' = up to a third '
+        'left · ' + _c('red', 'red') + ' = more left.',
+        _use('if many are left, raise step 1 <i>Reduction</i> or turn on <i>Second pass</i>, then '
+             'check the Tone close-up for green spikes above the yellow line.')),
+    'energy': _tip(
+        'Energy removed',
+        'The removed part\'s energy as a share of the original track\'s total energy.',
+        'AI tones carry very little energy, so removing only them gives tiny numbers. '
+        + _c('green', 'Under 1 %') + ' is typical; ' + _c('yellow', '1–5 %') + ' usually means a '
+        'strong top-band cut; ' + _c('red', 'over 5 %') + ' means audible music is being taken.',
+        _use('if it is yellow or red, listen with Hear Removed and lower the step 2 Reduction.')),
+    'flatness': _tip(
+        'Removed sound is',
+        'Measures what the removed part is made of (its spectral flatness). Tones are peaky; music '
+        'and hiss are spread out.',
+        _use('if it says “mostly music”, the settings are too strong — lower the Reductions or the '
+             'Sensitivity, and listen with Hear Removed.'),
+        items=(('mostly tones ✓', 'under 0.2 — only the whistles were taken'),
+               ('tones + some music', '0.2 – 0.5 — usually the top-band cut; check by ear'),
+               ('mostly music — too much', 'over 0.5 — real music is being removed'))),
+
+    # ── History ─────────────────────────────────────────────
+    'history': _tip(
+        'History',
+        'Every clean is kept as a version, newest on top: its number, time, preset, what changed '
+        'from the version before, and its result. Nothing is lost while you experiment.',
+        _use('click a version to hear it as B. Double-click it to load its settings back into the '
+             'controls. Use Add to comparison to put a few versions on C, D … and Tab between them.'),
+        items=(('Click', 'hear that version as B'),
+               ('Double-click', 'load its settings'),
+               ('Ctrl+Z / Ctrl+Y', 'settings one step back / forward'),
+               ('Hover', 'full list of its settings'))),
+    'hist_cmp': _tip(
+        'Add to comparison',
+        'Puts the selected version on the next free slot (C, D …), so Tab steps through it too.',
+        _use('pick your two or three best versions, add them, then Tab between A, B, C … at the '
+             'same spot in the song.')),
+    'hist_load': _tip(
+        'Load settings',
+        'Sets every control back to how they were for the selected version, and re-cleans.',
+        _use('go back to a version that sounded better and continue tweaking from there. '
+             'Double-clicking an entry does the same.')),
+    'hist_track': _tip(
+        'This track only',
+        'On: the list shows only versions of the loaded track. Off: versions of every track.',
+        _use('turn it off to load settings you made on another track.')),
+    'hist_clear': _tip(
+        'Clear',
+        'Deletes the versions shown in the list and their stored audio. When they are cleared '
+        'automatically is set in Settings.'),
+    'height_grip': _tip('Resize', 'Drag up or down to change the height of the list.'),
+
+    # ── Step 1 · AI tones ───────────────────────────────────
+    'tones': _tip(
+        '1 · Remove AI tones',
+        'AI music generators leave steady, very narrow tones (whistles) in the high frequencies.',
+        AI_TONE_DEF,
+        'Each tone found gets a notch centred on it, twice as wide as the tone (at most 30 Hz), '
+        'turned down by <i>Reduction</i>. Because the notches are so narrow, the music next to them '
+        'is not affected. The <b>On</b> box turns this step off.',
+        _use('the preset defaults work for most tracks. If whistles remain, raise Sensitivity or '
+             'Reduction; if a real sustained note (organ, synth pad) is being notched, untick it in '
+             'the tone list or raise <i>Search above</i>.')),
+    'sens': _tip(
+        'Sensitivity',
+        'How many dB a narrow, steady peak must stand above the median of the surrounding 600 Hz to '
+        'count as an AI tone. The number on the right is that threshold; it is drawn as the yellow '
+        'dashed line in the Tone close-up.',
+        'Further right = lower threshold = fainter tones are caught too, but more chance of notching '
+        'something musical. Gentle uses 5 dB, Normal 4 dB, Strong 3 dB.',
+        _use('if the Result still shows many tones left, or you still hear faint whistles, move it '
+             'right one step at a time.')),
+    'tdepth': _tip(
+        'Reduction (tones)',
+        'How much each notched tone is turned down. −40 dB makes a tone inaudible in almost all '
+        'music; −60 dB and below only matter for very loud tones.',
+        _use('leave it at −40 dB unless a tone stays audible; then go deeper.')),
+    'minhz': _tip(
+        'Search above',
+        'Tones are only searched for above this frequency. AI tones sit mostly above 5 kHz; below '
+        'that, steady peaks are usually real notes, bass or synth drones.',
+        _use('lower it only if you hear a whistle below this frequency; raise it if real sustained '
+             'notes are being notched.')),
+    'pass2': _tip(
+        'Second pass',
+        'After the first clean, the result is searched again. Tones that were hidden next to louder '
+        'ones become visible once those are gone, and get notched too.',
+        _use('keep it on; turn it off only for the gentlest possible clean.')),
+    'detect': _tip(
+        'Auto-detect tones',
+        'Searches this track for AI tones with the current Sensitivity and Search above, and '
+        'replaces the tone list with what is found. Hand edits to the list are lost.',
+        _use('press it after changing Sensitivity or Search above on a track whose list you edited, '
+             'or when the list came from another track.')),
+    'show_list': _tip(
+        'Tone list',
+        'Shows or hides the list of notches, one per AI tone.',
+        _use('open it to check what was found, switch single tones off, fix a frequency or width, '
+             'or add tones by hand.')),
+    'notch_table': _tip(
+        'Tone list',
+        'Every notch that is applied in step 1, lowest frequency first.',
+        _use('untick a tone to leave it in the track; double-click a frequency or width to type a '
+             'new value. Changes re-clean straight away.'),
+        items=(('Tick box', 'untick to leave that tone in'),
+               ('Freq Hz', 'centre of the notch'),
+               ('Width Hz', 'how wide the notch is — wider catches a wobbly tone, but takes more music'),
+               ('Stands out', 'how many dB the tone rose above its surroundings'))),
+    'notch_add': _tip(
+        'Add',
+        'Adds a 20 Hz wide notch in the middle of the spectrum view (or at 8 kHz).',
+        _use('easier: Shift + click the spike in the spectrum, or right-click it in a graph below, '
+             'to add a notch exactly there.')),
+    'notch_del': _tip('Remove', 'Removes the selected notches from the list; those tones are left in.'),
+    'notch_clear': _tip('Clear', 'Removes every notch; no tones are cut until you detect or add again.'),
+
+    # ── Step 2 · top band ───────────────────────────────────
+    'shelf': _tip(
+        '2 · Soften the harsh top band',
+        'AI music often has a hissy, glassy "sizzle" spread over the whole treble — not single '
+        'tones, so notches cannot catch it. This step turns the whole top band down instead.',
+        'Nothing below <i>Fade from</i> (orange line) is touched. Between <i>Fade from</i> and '
+        '<i>Full from</i> (red line) the cut fades in; above <i>Full from</i> it is at full '
+        '<i>Reduction</i>. The <b>On</b> box turns this step off.',
+        _use('set Fade from where the harshness starts, keep Full from 3–5 kHz above it, and use '
+             'the smallest Reduction that removes the sizzle. Compare with Tab: if cymbals and '
+             '\'s\' sounds go dull, it is too much.'),
+        items=(('Left click spectrum', 'move the orange line'),
+               ('Right click spectrum', 'move the red line'))),
+    'sdepth': _tip(
+        'Reduction (top band)',
+        'How much the band above the red line is turned down. −6 dB is a light polish, −12 dB '
+        'clearly softer, −24 dB a hard cut that can dull cymbals.',
+        _use('start at −6 to −12 dB and raise it only while B still sounds harsh.')),
+    'fade': _tip(
+        'Fade from',
+        'Where the top-band cut starts (orange line). Everything below stays untouched.',
+        _use('lower = more of the treble is softened. 14 kHz suits most tracks; go down to 12 kHz '
+             'for very harsh ones. Same as left-dragging the orange line.')),
+    'cut': _tip(
+        'Full from',
+        'Where the cut reaches full <i>Reduction</i> (red line). Must be above <i>Fade from</i>.',
+        _use('a wider gap to Fade from gives a softer, less noticeable transition. Same as '
+             'right-dragging the red line.')),
+    'curve': _tip(
+        'Curve',
+        'The shape of the fade between the orange and red lines.',
+        _use('Cosine is right for nearly everything; try Steep to keep more of the band just above '
+             'the orange line.'),
+        items=(('Cosine', 'smooth S-shape, least audible'), ('Linear', 'straight ramp'),
+               ('Steep', 'most of the drop close to the red line'))),
+
+    # ── Save ────────────────────────────────────────────────
+    'save_card': _tip(
+        'Save',
+        'Writes files to the output folder. Format and name suffix are set in the Settings menu.',
+        items=(('Save', 'the cleaned track (B)'),
+               ('Save Removed', 'only what was removed'),
+               ('Save All…', 'clean and save every track in the list'))),
+    'save': _tip(
+        'Save',
+        'Writes the version on B (the one picked in History) to the output folder, with the name '
+        'suffix and format from Settings.',
+        _use('pick the version you like in History first, then Save.')),
+    'save_removed': _tip(
+        'Save Removed',
+        'Writes only the removed part (original minus cleaned) as its own file.',
+        _use('handy to check by ear or in another editor exactly what was taken out.')),
+    'batch': _tip(
+        'Save All…',
+        'Cleans and saves every track in the list in one go. The next window lets you choose the '
+        'tracks, which settings to use, how tones are found, and where to save.',
+        _use('tune the settings on one or two typical tracks first, then run Save All.')),
+    'batch_stop': _tip('Stop', 'Stops after the track that is being cleaned now. Tracks already '
+                               'saved are kept.'),
+
+    # ── Advanced ────────────────────────────────────────────
+    'adv': _tip(
+        'Advanced',
+        'How the reduction is applied. The defaults suit most tracks; change these only if a '
+        'specific problem remains.'),
+    'method': _tip(
+        'Method',
+        'How the targeted frequencies are turned down.',
+        _use('keep Static. Try Adaptive if a cleaned track loses some real musical content in the '
+             'notched or top-band frequencies.'),
+        items=(('Static', 'fixed reduction all the time — predictable and transparent'),
+               ('Adaptive', 'measures the steady background (the noise profile) and removes only '
+                            'that, letting loud musical moments in those frequencies through'))),
+    'oversub': _tip(
+        'Oversub (Adaptive)',
+        'How many times the noise profile is subtracted. Higher removes more of the steady part, '
+        'but can leave watery or chirpy artefacts.',
+        _use('2× is a good start; raise it if tones remain, lower it if you hear artefacts.')),
+    'pct': _tip(
+        'Percentile (Adaptive)',
+        'The noise profile is this percentile of each frequency\'s level over time. 50 % = its '
+        'typical level; lower = only the quietest moments count as noise.',
+        _use('lower it if the adaptive cut eats into music; raise it if tones remain.')),
+    'attack': _tip(
+        'Attack (Adaptive)',
+        'How fast the reduction lets go when music arrives in a frequency.',
+        _use('short (≈5 ms) keeps transients like hi-hats intact.')),
+    'release': _tip(
+        'Release (Adaptive)',
+        'How fast the reduction comes back after the music in that frequency stops.',
+        _use('longer = smoother but the tone may peek through after loud moments.')),
+    'smooth': _tip(
+        'Smooth gain (Adaptive)',
+        'Smooths the adaptive reduction across neighbouring frequencies and moments (3×3 median).',
+        _use('keep on; it prevents "musical noise" — random little chirps in the cleaned track.')),
+    'profile': _tip(
+        'Noise profile (Adaptive)',
+        'Where the steady background is measured — the whole track, or a region you picked.',
+        _use('drag across a quiet part of the Tone lines view where the tones are clearly audible '
+             'but little music plays (an intro or outro works well).')),
+    'profile_clear': _tip('Whole track', 'Measures the noise profile over the whole track again.'),
+    'stereo': _tip(
+        'Stereo',
+        'How left and right are treated. AI tones usually sit dead-centre (the same in both '
+        'channels) while music is spread wide.',
+        _use('keep L / R. If B sounds narrower than A, try Mid only or Coherence — they leave the '
+             'stereo width alone.'),
+        items=(('L / R', 'clean both channels the same way'),
+               ('Mid only', 'clean only the centre; the sides stay untouched'),
+               ('Coherence', 'cut more where left and right are identical (the tones), less where '
+                             'they differ (the music)'))),
+    'fft': _tip(
+        'FFT size',
+        'The analysis resolution. Larger = finer frequency steps, so narrower notches and better '
+        'detection of close tones, but less precise in time. Auto picks a size for the sample rate '
+        '(about 2.9 Hz steps for tones, 11.7 Hz for the top band). The line below shows the values.',
+        _use('leave on Auto.')),
+    'runs_on': _tip(
+        'Runs on',
+        'Whether processing runs on the graphics card (much faster) or the processor. Switch in '
+        'Settings.'),
+
+    # ── Settings dialog ─────────────────────────────────────
+    'set_suffix': _tip(
+        'Name suffix',
+        'Added to the file name of everything you save, e.g. song<b>_cleaned</b>.wav. Leave empty '
+        'to keep the original name (files are saved to the output folder, so the original is not '
+        'overwritten).'),
+    'set_format': _tip(
+        'Output format',
+        'File type of saved tracks.',
+        _use('use WAV or FLAC. Saving as MP3 adds a second lossy encode, and MP3 cuts off near 16 kHz '
+             'anyway.'),
+        items=(('WAV 24-bit', 'lossless, plays everywhere'),
+               ('WAV 32-bit float', 'lossless, for further editing'),
+               ('FLAC 24-bit', 'lossless and about half the size'),
+               ('MP3 320 kbps', 'small, lossy'),
+               ('Same as input', 'keeps WAV / FLAC / AIFF / MP3; others become FLAC 24-bit'))),
+    'set_detect': _tip(
+        'Auto-detect on open',
+        'On: every track gets its own AI tones found when you open it (recommended — tones differ '
+        'per track).',
+        'Off: every track uses the last tone list you had. Press Auto-detect tones to find them for '
+        'the current track.'),
+    'set_gpu': _tip(
+        'Process on the GPU',
+        'Runs the heavy FFT work on an NVIDIA graphics card through PyTorch + CUDA — several times '
+        'faster. Off: the processor (SciPy) does it. The result is the same.'),
+    'set_hist_lines': _tip(
+        'History lines',
+        'What each History entry shows.',
+        items=(('Number, time and preset', 'which version it is'),
+               ('What changed', 'settings changed since the version before'),
+               ('Result', 'tones left and amount removed'))),
+    'set_hist_clear': _tip(
+        'Clear history',
+        'When History and its stored versions are deleted.',
+        items=(('When the program closes', 'fresh start every session'),
+               ('When switching track', 'deletes the history of the track you leave'),
+               ('Never', 'keep every version (uses disk space)'))),
+
+    # ── Batch dialog ────────────────────────────────────────
+    'b_tracks': _tip(
+        'Tracks',
+        'The tracks to clean and save.',
+        _use('untick the ones to skip. All / None tick or untick everything.')),
+    'b_current': _tip(
+        'Current settings',
+        'Exactly what the panel shows now, including your own tweaks and the Advanced settings.'),
+    'b_strength': _tip(
+        'Cleaning strength',
+        'Uses Gentle, Normal or Strong for the tone and top-band settings. The Advanced settings '
+        'stay as they are.'),
+    'b_user': _tip(
+        'Saved preset',
+        'Uses one of your saved presets for the tone and top-band settings. The Advanced settings '
+        'stay as they are.'),
+    'b_detect': _tip(
+        'Find tones per track',
+        'Each track gets its own AI tones found. Recommended: tones differ from track to track, '
+        'even from the same generator.'),
+    'b_list': _tip(
+        'Use the current tone list',
+        'Every track gets the tone list of the loaded track.',
+        _use('only for several renders of the same song, where the tones are identical.')),
+    'b_manual': _tip(
+        'Keep hand-edited lists',
+        'Tracks whose tone list you edited by hand keep that list instead of being detected again.'),
+    'b_folder': _tip('Folder', 'Where the cleaned files are written.'),
+    'b_suffix': _tip('Name suffix', 'Added to every file name, e.g. song<b>_cleaned</b>.wav.'),
+    'b_removed': _tip(
+        'Also save the removed part',
+        'Writes a second file per track with only what was removed (…_removed).'),
+}
+TIPS['b_format'] = TIPS['set_format']
+
+
+class RichToolTip(QObject):
+    """Replaces Qt's small tooltip with a larger, wrapped, styled panel.
+    Installed on the QApplication, so every setToolTip() text goes through it."""
+    MAX_W = 460
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.win = QFrame(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.win.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.win.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.win.setStyleSheet('QFrame { background-color: #181825; border: 1px solid #89b4fa; }'
+                               'QLabel { background: transparent; border: none; color: #cdd6f4; }')
+        lay = QVBoxLayout(self.win)
+        lay.setContentsMargins(14, 10, 14, 12)
+        self.label = QLabel()
+        self.label.setTextFormat(Qt.TextFormat.RichText)
+        self.label.setWordWrap(True)
+        font = QFont('Segoe UI')
+        font.setPixelSize(13)
+        self.label.setFont(font)
+        lay.addWidget(self.label)
+        self._owner = None
+        self._origin = QPoint()
+        app = QApplication.instance()
+        app.installEventFilter(self)
+        app.aboutToQuit.connect(lambda: app.removeEventFilter(self))   # the panel is deleted on exit
+
+    @staticmethod
+    def _text_for(obj: QWidget, event) -> str:
+        view = obj.parent()
+        if isinstance(view, QAbstractItemView) and obj is view.viewport():
+            idx = view.indexAt(event.pos())
+            text = idx.data(Qt.ItemDataRole.ToolTipRole) if idx.isValid() else None
+            return str(text) if text else view.toolTip()
+        return obj.toolTip()
+
+    def _show(self, owner: QWidget, text: str):
+        if not Qt.mightBeRichText(text):
+            text = text.replace('&', '&amp;').replace('<', '&lt;').replace('\n', '<br>')
+        doc = QTextDocument()
+        doc.setDefaultFont(self.label.font())
+        doc.setHtml(text)
+        self.label.setText(text)
+        self.label.setFixedWidth(int(min(doc.idealWidth(), self.MAX_W)) + 4)
+        self.win.adjustSize()
+
+        pos = QCursor.pos()
+        screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        w, h = self.win.width(), self.win.height()
+        x = min(pos.x() + 16, area.right() - w)
+        y = pos.y() + 22
+        if y + h > area.bottom():
+            y = pos.y() - h - 8
+        self.win.move(max(x, area.left()), max(y, area.top()))
+        self._owner, self._origin = owner, pos
+        self.win.show()
+        self.win.raise_()
+
+    def hide(self):
+        self.win.hide()
+        self._owner = None
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if t == QEvent.Type.ToolTip and isinstance(obj, QWidget):
+            text = self._text_for(obj, event)
+            if not text:
+                return False
+            self._show(obj, text)
+            return True
+        if self.win.isVisible():
+            if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick, QEvent.Type.Wheel,
+                     QEvent.Type.KeyPress, QEvent.Type.WindowDeactivate):
+                self.hide()
+            elif t in (QEvent.Type.Leave, QEvent.Type.Hide) and obj is self._owner:
+                self.hide()
+            elif t == QEvent.Type.MouseMove and (QCursor.pos() - self._origin).manhattanLength() > 40:
+                self.hide()
+        return False
+
 
 def _hint(text: str, wrap: bool = True) -> QLabel:
     lbl = QLabel(text)
@@ -2251,6 +2976,35 @@ class WheelTrapList(QListWidget):
         event.accept()
 
 
+class HeightGrip(QWidget):
+    """Drag bar under a widget that sets its height."""
+    resized = pyqtSignal(int)
+
+    def __init__(self, target: QWidget, minimum: int = 80, parent=None):
+        super().__init__(parent)
+        self.setObjectName('height_grip')
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(6)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setToolTip(TIPS['height_grip'])
+        self._target, self._min = target, minimum
+        self._start = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._start = (event.globalPosition().y(), self._target.height())
+
+    def mouseMoveEvent(self, event):
+        if self._start is not None:
+            y0, h0 = self._start
+            self._target.setFixedHeight(max(self._min, int(h0 + event.globalPosition().y() - y0)))
+
+    def mouseReleaseEvent(self, event):
+        if self._start is not None:
+            self._start = None
+            self.resized.emit(self._target.height())
+
+
 class WheelTrapTable(QTableWidget):
     def wheelEvent(self, event):
         super().wheelEvent(event)
@@ -2267,6 +3021,7 @@ class MainWindow(QMainWindow):
     OUTPUT_DIR   = BASE_DIR / 'output'
     PRESET_DIR   = BASE_DIR / 'presets'
     HISTORY_FILE = BASE_DIR / 'history.json'
+    VERSION_DIR  = BASE_DIR / 'history_versions'
     HISTORY_MAX  = 200
 
     DEFAULT_SUFFIX = '_cleaned'
@@ -2287,11 +3042,10 @@ class MainWindow(QMainWindow):
         'percentile': ' %', 'oversub': '×',
     }
 
-    _AB_LABELS = [
-        ('A  Original', 'btn_ab_a'),
-        ('B  Cleaned',  'btn_ab_b'),
-    ]
-    _MODE_COLORS = {'orig': C['orig'], 'proc': C['proc'], 'res': C['res']}
+    _MODE_COLORS = {'orig': C['orig'], 'proc': C['proc'], 'res': C['res'], 'cmp': C['cmp']}
+    _RESULT_KEYS = ('audio', 'boost', 'psd_f', 'psd_proc', 'prom_proc', 'view_proc', 'view_res',
+                    'tones_before', 'tones_after', 'energy_pct', 'flatness')
+    VERSION_MEM = 4   # rendered versions kept in RAM besides the temp folder
 
     _CURVES  = [('Cosine (smooth)', 'cosine'), ('Linear', 'linear'), ('Steep', 'steep')]
     _METHODS = [('Static — fixed reduction', 'static'),
@@ -2306,7 +3060,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('FrequencyCleaner — remove the AI sound')
+        self.setWindowTitle('FrequencyCleaner')
         self.setMinimumSize(1280, 820)
 
         # ── Audio data ───────────────────────────────────────
@@ -2340,20 +3094,41 @@ class MainWindow(QMainWindow):
         self._hist_current: int | None = None   # id of the entry the shown result belongs to
         self._hist_next_id = max((e['id'] for e in self._history), default=0) + 1
         self._user_preset_map: dict = {}         # name → (file path, settings dict)
-        self._ref_id: int | None = None          # history entry playing as A
-        self._ref_worker: RenderWorker | None = None
-        self._ref_generation = 0
+        self._b: dict | None = None              # result playing as B
+        self._b_id: int | None = None            # history entry playing as B
+        self._cmp: list = []                     # results on C, D, … (each carries its 'id')
+        self._hist_pending: int | None = None    # entry being rendered for B
+        self._hist_worker: CleanWorker | None = None
+        self._hist_generation = 0
+
+        # Every rendered version is stored, so switching between them is instant.
+        self._hist_lines = {k: self._settings.value(f'history_line_{k}', True, type=bool)
+                            for k, _ in SettingsDialog.HISTORY_LINES}
+        self._hist_clear = self._settings.value('history_clear', 'close', type=str)
+        if self._hist_clear not in dict(SettingsDialog.HISTORY_CLEAR):
+            self._hist_clear = 'close'
+        self._vdir = self.VERSION_DIR
+        self._vdir.mkdir(parents=True, exist_ok=True)
+        self._vmem: OrderedDict = OrderedDict()
+        self._vwriters: list = []
+        self._prune_versions()
+
+        # ── Loop ─────────────────────────────────────────────
+        self._loop_on = self._settings.value('loop_on', False, type=bool)
+        self._loop_region: tuple | None = None   # seconds; None = whole track
+        self._cb_loop: tuple | None = None       # frames (start, end) while looping
 
         # ── Callback-shared state  (CPython GIL → atomic reads/writes) ──
         self._audio_orig: np.ndarray | None = None
-        self._audio_proc: np.ndarray | None = None
+        self._audio_proc: np.ndarray | None = None   # B
+        self._audio_play: np.ndarray | None = None   # what the current slot plays (None = original)
+        self._audio_solo: np.ndarray | None = None   # version whose removed part R plays
+        self._solo_boost: float = 1.0
         self._cb_frame:   int   = 0
         self._cb_playing: bool  = False
-        self._ab_mode:    int   = 1        # 0=original  1=cleaned (start on B: hear the result)
+        self._slot:       int   = 1        # 0=A original  1=B  2…=C, D … (start on B: hear the result)
         self._solo_residual: bool = False
         self._cb_volume:  float = 0.85
-        self._residual_boost: float = 1.0
-        self._audio_ref:  np.ndarray | None = None   # history version played as A
 
         # ── Playback ─────────────────────────────────────────
         self._stream: sd.OutputStream | None = None
@@ -2391,6 +3166,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence('Space'), self).activated.connect(self._toggle_play)
         QShortcut(QKeySequence('Tab'),   self).activated.connect(self._toggle_ab)
         QShortcut(QKeySequence('r'),     self).activated.connect(self._toggle_solo_residual)
+        QShortcut(QKeySequence('l'),     self).activated.connect(self.btn_loop.toggle)
         QShortcut(QKeySequence('Left'),  self).activated.connect(lambda: self._seek_rel(-5))
         QShortcut(QKeySequence('Right'), self).activated.connect(lambda: self._seek_rel(5))
         QShortcut(QKeySequence('Ctrl+Z'), self).activated.connect(lambda: self._history_step(-1))
@@ -2422,7 +3198,7 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self):
         dlg = SettingsDialog(self, self.name_suffix, self.export_format,
-                             self.detect_on_load, GPU.enabled)
+                             self.detect_on_load, GPU.enabled, self._hist_lines, self._hist_clear)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             if dlg.use_gpu() is not None:
                 GPU.enabled = dlg.use_gpu()
@@ -2435,7 +3211,13 @@ class MainWindow(QMainWindow):
             self._settings.setValue('name_suffix', self.name_suffix)
             self._settings.setValue('export_format', self.export_format)
             self._settings.setValue('detect_on_load_v2', self.detect_on_load)
+            self._hist_lines = dlg.history_lines()
+            self._hist_clear = dlg.history_clear()
+            for k, v in self._hist_lines.items():
+                self._settings.setValue(f'history_line_{k}', v)
+            self._settings.setValue('history_clear', self._hist_clear)
             self._update_export_label()
+            self._refresh_history_list()
 
     def _build_ui(self):
         root = QWidget()
@@ -2454,6 +3236,7 @@ class MainWindow(QMainWindow):
         self.lbl_steps = QLabel()
         self.lbl_steps.setObjectName('lbl_steps')
         self.lbl_steps.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_steps.setToolTip(TIPS['workflow'])
         cl.addWidget(self.lbl_steps)
 
         self.view_frame = QFrame()
@@ -2464,16 +3247,23 @@ class MainWindow(QMainWindow):
 
         zoom_row = QHBoxLayout()
         zoom_row.setContentsMargins(6, 2, 6, 0)
-        zoom_row.addWidget(_hint('Spectrum view:', wrap=False))
+        lbl_zoom = _hint('Spectrum view:', wrap=False)
+        lbl_zoom.setToolTip(TIPS['spec_view'])
+        zoom_row.addWidget(lbl_zoom)
         self.btn_zoom_full = QPushButton('Full range')
         self.btn_zoom_band = QPushButton('AI tone band')
+        self.btn_zoom_full.setToolTip(TIPS['zoom_full'])
+        self.btn_zoom_band.setToolTip(TIPS['zoom_band'])
         for b in (self.btn_zoom_full, self.btn_zoom_band):
             b.setObjectName('btn_small')
+            b.setCheckable(True)
             zoom_row.addWidget(b)
+        self.btn_zoom_full.setChecked(True)
         zoom_row.addStretch()
         legend = _hint('Blue = original · Green = cleaned · Red = removed · '
                        'small red ticks = tones found', wrap=False)
         legend.setStyleSheet('font-size: 12px;')
+        legend.setToolTip(TIPS['colours'])
         zoom_row.addWidget(legend)
         vf.addLayout(zoom_row)
 
@@ -2482,6 +3272,7 @@ class MainWindow(QMainWindow):
         sp.setContentsMargins(0, 0, 0, 0)
         sp.setSpacing(2)
         self.spectrum = SpectrumCanvas()
+        self.spectrum.setToolTip(TIPS['spectrum'])
         sp.addWidget(self.spectrum, stretch=1)
         pan_row = QHBoxLayout()
         pan_row.setContentsMargins(6, 0, 6, 2)
@@ -2491,7 +3282,7 @@ class MainWindow(QMainWindow):
         self.slider_pan = QSlider(Qt.Orientation.Horizontal)
         self.slider_pan.setRange(0, 10000)
         self.slider_pan.setEnabled(False)
-        self.slider_pan.setToolTip('Pan the spectrum view (active when zoomed in)')
+        self.slider_pan.setToolTip(TIPS['pan'])
         pan_row.addWidget(self.slider_pan)
         sp.addLayout(pan_row)
 
@@ -2501,7 +3292,9 @@ class MainWindow(QMainWindow):
         lw.setSpacing(2)
         view_row = QHBoxLayout()
         view_row.setContentsMargins(6, 0, 6, 0)
-        view_row.addWidget(_hint('Lower view:', wrap=False))
+        lbl_lower = _hint('Lower view:', wrap=False)
+        lbl_lower.setToolTip(TIPS['lower_view'])
+        view_row.addWidget(lbl_lower)
         self.btn_view_close = QPushButton('Tone close-up')
         self.btn_view_lines = QPushButton('Tone lines over time')
         self.view_group = QButtonGroup(self)
@@ -2511,6 +3304,8 @@ class MainWindow(QMainWindow):
             self.view_group.addButton(b)
             view_row.addWidget(b)
         self.btn_view_close.setChecked(True)
+        self.btn_view_close.setToolTip(TIPS['closeup'])
+        self.btn_view_lines.setToolTip(TIPS['tonelines'])
         view_row.addStretch()
         lw.addLayout(view_row)
         self.lower_stack = QStackedWidget()
@@ -2558,14 +3353,17 @@ class MainWindow(QMainWindow):
         self.file_list = QListWidget()
         self.file_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.file_list.setToolTip(TIPS['tracks'])
         ll.addWidget(self.file_list, stretch=1)
 
         self.lbl_track = QLabel('No track loaded')
         self.lbl_track.setWordWrap(True)
         self.lbl_track.setStyleSheet('color: #a6adc8; font-size: 11px; padding: 4px;')
+        self.lbl_track.setToolTip(TIPS['loaded_track'])
         ll.addWidget(self.lbl_track)
 
         btn_add = QPushButton('+ Add Files…')
+        btn_add.setToolTip(TIPS['add_files'])
         btn_add.clicked.connect(self._browse_files)
         ll.addWidget(btn_add)
         ll.addWidget(_hint('Or drag & drop audio files onto the window.'))
@@ -2585,6 +3383,7 @@ class MainWindow(QMainWindow):
         tl.addWidget(self.lbl_time_cur)
         self.slider_pos = ClickSlider(Qt.Orientation.Horizontal)
         self.slider_pos.setRange(0, 10000)
+        self.slider_pos.setToolTip(TIPS['position'])
         tl.addWidget(self.slider_pos)
         self.lbl_time_tot = QLabel('0:00')
         self.lbl_time_tot.setFixedWidth(40)
@@ -2600,39 +3399,59 @@ class MainWindow(QMainWindow):
         self.btn_play.setObjectName('btn_primary')
         self.btn_play.setMinimumWidth(96)
         self.btn_play.setEnabled(False)
-        self.btn_play.setToolTip('Space')
+        self.btn_play.setToolTip(TIPS['play'])
         br.addWidget(self.btn_play)
 
         self.btn_stop = QPushButton(' Stop')
         self.btn_stop.setIcon(_transport_icon('stop', '#cdd6f4'))
         self.btn_stop.setEnabled(False)
+        self.btn_stop.setToolTip(TIPS['stop'])
         br.addWidget(self.btn_stop)
 
         br.addSpacing(12)
-        label, obj = self._AB_LABELS[self._ab_mode]
+        label, obj = self._slot_label()
         self.btn_ab = QPushButton(label)
         self.btn_ab.setObjectName(obj)
         self.btn_ab.setMinimumWidth(120)
         self.btn_ab.setEnabled(False)
-        self.btn_ab.setToolTip('Tab — switch between the original and the cleaned version')
+        self.btn_ab.setToolTip(TIPS['ab'])
         br.addWidget(self.btn_ab)
 
         self.btn_solo = QPushButton('Hear Removed')
         self.btn_solo.setObjectName('btn_ab_c')
         self.btn_solo.setEnabled(False)
         self.btn_solo.setCheckable(True)
-        self.btn_solo.setToolTip('R — hear only what the cleaner takes out (level-boosted). '
-                                 'This should sound like the whistle/sizzle, not like music.')
+        self.btn_solo.setToolTip(TIPS['solo'])
         br.addWidget(self.btn_solo)
 
-        br.addStretch()
-        br.addWidget(_hint('Space ▶ · Tab A/B · R removed · ◀/▶ 5 s', wrap=False))
         br.addSpacing(12)
-        br.addWidget(QLabel('Vol'))
-        self.slider_vol = QSlider(Qt.Orientation.Horizontal)
+        self.btn_loop = QPushButton('Loop')
+        self.btn_loop.setObjectName('btn_loop')
+        self.btn_loop.setCheckable(True)
+        self.btn_loop.setChecked(self._loop_on)
+        self.btn_loop.setToolTip(TIPS['loop'])
+        br.addWidget(self.btn_loop)
+        self.btn_loop_sec = QPushButton('Loop Section')
+        self.btn_loop_sec.setToolTip(TIPS['loop_sec'])
+        br.addWidget(self.btn_loop_sec)
+        self.lbl_loop = QLabel('')
+        self.lbl_loop.setStyleSheet(f'color: {C["loop"]};')
+        br.addWidget(self.lbl_loop)
+
+        br.addStretch()
+        keys = _hint('Space ▶ · Tab A/B · R removed · L loop · ◀/▶ 5 s', wrap=False)
+        keys.setToolTip(TIPS['keys'])
+        br.addWidget(keys)
+        br.addSpacing(12)
+        lbl_vol = QLabel('Vol')
+        br.addWidget(lbl_vol)
+        self.slider_vol = ClickSlider(Qt.Orientation.Horizontal)
         self.slider_vol.setRange(0, 100)
         self.slider_vol.setValue(85)
         self.slider_vol.setFixedWidth(100)
+        tip = TIPS['volume']
+        lbl_vol.setToolTip(tip)
+        self.slider_vol.setToolTip(tip)
         br.addWidget(self.slider_vol)
         pb.addLayout(br)
         return frame
@@ -2670,6 +3489,7 @@ class MainWindow(QMainWindow):
 
         # ── Strength presets ─────────────────────────────────
         box_p = self._card('Cleaning strength', 'strength')
+        box_p.setToolTip(TIPS['strength'])
         bp = QVBoxLayout(box_p.body)
         row = QHBoxLayout()
         row.setSpacing(6)
@@ -2679,22 +3499,23 @@ class MainWindow(QMainWindow):
             b = QPushButton(p['label'])
             b.setObjectName('btn_preset')
             b.setCheckable(True)
-            b.setToolTip(p['text'])
+            b.setToolTip(_tip(p['label'], p['text']))
             self.preset_group.addButton(b)
             self.preset_buttons[key] = b
             row.addWidget(b)
         bp.addLayout(row)
         self.lbl_preset = _hint('')
+        self.lbl_preset.setToolTip(TIPS['strength'])
         bp.addWidget(self.lbl_preset)
         ur = QHBoxLayout()
         ur.setSpacing(4)
         self.combo_user_presets = QComboBox()
-        self.combo_user_presets.setToolTip('Your saved presets — pick one to load it.')
+        self.combo_user_presets.setToolTip(TIPS['user_presets'])
         ur.addWidget(self.combo_user_presets, stretch=1)
         self.btn_preset_save = QPushButton('Save as…')
-        self.btn_preset_save.setToolTip('Save all current settings as a named preset')
+        self.btn_preset_save.setToolTip(TIPS['preset_save'])
         self.btn_preset_del = QPushButton('Delete')
-        self.btn_preset_del.setToolTip('Delete the preset picked on the left')
+        self.btn_preset_del.setToolTip(TIPS['preset_del'])
         self.btn_preset_del.setEnabled(False)
         for b in (self.btn_preset_save, self.btn_preset_del):
             b.setObjectName('btn_small')
@@ -2704,22 +3525,30 @@ class MainWindow(QMainWindow):
 
         # ── Result ───────────────────────────────────────────
         box_q = self._card('Result', 'result')
+        box_q.setToolTip(TIPS['result'])
         bq = QGridLayout(box_q.body)
         bq.setVerticalSpacing(4)
         self.lbl_tones_big = QLabel('—')
         self.lbl_tones_big.setObjectName('lbl_big')
         bq.addWidget(self.lbl_tones_big, 0, 0, 1, 2)
         self.lbl_tones_sub = _hint('AI tones found → still audible after cleaning')
+        tip = TIPS['tones_count']
+        self.lbl_tones_big.setToolTip(tip)
+        self.lbl_tones_sub.setToolTip(tip)
         bq.addWidget(self.lbl_tones_sub, 1, 0, 1, 2)
-        bq.addWidget(QLabel('Energy removed'), 2, 0)
+        lbl = QLabel('Energy removed')
+        lbl.setToolTip(TIPS['energy'])
+        bq.addWidget(lbl, 2, 0)
         self.lbl_energy = QLabel('—')
         self.lbl_energy.setObjectName('lbl_metric')
         bq.addWidget(self.lbl_energy, 2, 1, alignment=Qt.AlignmentFlag.AlignRight)
-        bq.addWidget(QLabel('Removed sound is'), 3, 0)
+        lbl = QLabel('Removed sound is')
+        bq.addWidget(lbl, 3, 0)
         self.lbl_flat = QLabel('—')
         self.lbl_flat.setObjectName('lbl_metric')
-        self.lbl_flat.setToolTip('Spectral flatness of the removed part. Near 0 = tones (good), '
-                                 'near 1 = broadband music (too much).')
+        tip = TIPS['flatness']
+        lbl.setToolTip(tip)
+        self.lbl_flat.setToolTip(tip)
         bq.addWidget(self.lbl_flat, 3, 1, alignment=Qt.AlignmentFlag.AlignRight)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
@@ -2729,24 +3558,26 @@ class MainWindow(QMainWindow):
 
         # ── History ──────────────────────────────────────────
         box_h = self._card('History', 'history')
+        box_h.setToolTip(TIPS['history'])
         bh = QVBoxLayout(box_h.body)
         bh.setSpacing(4)
         self.list_history = WheelTrapList()
-        self.list_history.setMinimumHeight(190)
+        self.list_history.setFixedHeight(self._settings.value('history_height', 190, type=int))
+        self.list_history.setAlternatingRowColors(True)
         self.list_history.setWordWrap(True)
         self.list_history.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.list_history.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.list_history.setToolTip('Every result is kept here, newest on top. Double-click to go back to it.')
+        self.list_history.setToolTip(TIPS['history'])
         bh.addWidget(self.list_history)
+        self.grip_history = HeightGrip(self.list_history)
+        bh.addWidget(self.grip_history)
         hr = QHBoxLayout()
         hr.setSpacing(4)
-        self.btn_hist_restore = QPushButton('Restore')
-        self.btn_hist_restore.setToolTip('Go back to the selected version (double-click does the same)')
-        self.btn_hist_ref = QPushButton('Compare as A')
-        self.btn_hist_ref.setToolTip('Play the selected version on A, so Tab switches between it and the current result')
-        self.btn_hist_ref_clear = QPushButton('A = Original')
-        self.btn_hist_ref_clear.setToolTip('Play the untouched original on A again')
-        for b in (self.btn_hist_restore, self.btn_hist_ref, self.btn_hist_ref_clear):
+        self.btn_hist_cmp = QPushButton('Add to comparison')
+        self.btn_hist_cmp.setToolTip(TIPS['hist_cmp'])
+        self.btn_hist_load = QPushButton('Load settings')
+        self.btn_hist_load.setToolTip(TIPS['hist_load'])
+        for b in (self.btn_hist_cmp, self.btn_hist_load):
             b.setObjectName('btn_small')
             b.setEnabled(False)
             hr.addWidget(b)
@@ -2754,51 +3585,57 @@ class MainWindow(QMainWindow):
         hr2 = QHBoxLayout()
         self.chk_hist_track = QCheckBox('This track only')
         self.chk_hist_track.setChecked(self._settings.value('history_track_only', True, type=bool))
+        self.chk_hist_track.setToolTip(TIPS['hist_track'])
         hr2.addWidget(self.chk_hist_track)
         hr2.addStretch()
         self.btn_hist_clear = QPushButton('Clear')
         self.btn_hist_clear.setObjectName('btn_small')
-        self.btn_hist_clear.setToolTip('Delete the history entries shown in the list')
+        self.btn_hist_clear.setToolTip(TIPS['hist_clear'])
         hr2.addWidget(self.btn_hist_clear)
         bh.addLayout(hr2)
-        bh.addWidget(_hint('Ctrl+Z / Ctrl+Y step back / forward through the list.'))
+        bh.addWidget(_hint('Click a version to hear it as B. '
+                           'Ctrl+Z / Ctrl+Y load the settings one step back / forward.'))
         lay.addWidget(box_h)
 
         # ── 1 · AI tones ─────────────────────────────────────
         self.box_tones = self._card('1 · Remove AI tones', 'tones')
         self.box_tones.setCheckable(True)
-        self.box_tones.setToolTip('Steady narrow tones (whistles) that AI generators leave in the '
-                                  'high frequencies. Removed with very narrow notches.')
+        self.box_tones.setToolTip(TIPS['tones'])
         bt = QVBoxLayout(self.box_tones.body)
         bt.setSpacing(6)
         g = QGridLayout()
         g.setHorizontalSpacing(8)
         self.sl_sens, self.lbl_sens = self._slider_row(
             g, 0, 'Sensitivity', 2, 10,
-            'How far above its surroundings a peak must stand to count as a tone. '
-            'Further right = catches fainter tones.')
+            TIPS['sens'])
         self.sl_tdepth, self.lbl_tdepth = self._slider_row(
-            g, 1, 'Reduction', -80, 0, 'How much each tone is reduced.', C['fade'])
-        g.addWidget(QLabel('Search above'), 2, 0)
+            g, 1, 'Reduction', -80, 0,
+            TIPS['tdepth'], C['fade'])
+        lbl = QLabel('Search above')
+        lbl.setToolTip(TIPS['minhz'])
+        g.addWidget(lbl, 2, 0)
         self.spin_minhz = QSpinBox()
         self.spin_minhz.setRange(1000, 20000)
         self.spin_minhz.setSingleStep(500)
         self.spin_minhz.setSuffix(' Hz')
         self.spin_minhz.setKeyboardTracking(False)
+        self.spin_minhz.setToolTip(TIPS['minhz'])
         g.addWidget(self.spin_minhz, 2, 1, 1, 2)
         bt.addLayout(g)
         self.chk_pass2 = QCheckBox('Second pass (catch leftovers)')
+        self.chk_pass2.setToolTip(TIPS['pass2'])
         bt.addWidget(self.chk_pass2)
 
         tr = QHBoxLayout()
         self.btn_detect = QPushButton('Auto-detect tones')
-        self.btn_detect.setToolTip('Find the AI tones in this track and replace the tone list with them')
+        self.btn_detect.setToolTip(TIPS['detect'])
         self.btn_detect.setObjectName('btn_small')
         self.btn_detect.setEnabled(False)
         tr.addWidget(self.btn_detect)
         self.btn_show_list = QPushButton('Show tone list ▸')
         self.btn_show_list.setObjectName('btn_link')
         self.btn_show_list.setCheckable(True)
+        self.btn_show_list.setToolTip(TIPS['show_list'])
         tr.addWidget(self.btn_show_list)
         tr.addStretch()
         bt.addLayout(tr)
@@ -2818,13 +3655,16 @@ class MainWindow(QMainWindow):
         self.tbl_notches.setAlternatingRowColors(True)
         self.tbl_notches.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl_notches.setMinimumHeight(170)
-        self.tbl_notches.setToolTip('Double-click a frequency or width to edit. Untick to keep a tone.')
+        self.tbl_notches.setToolTip(TIPS['notch_table'])
         lb.addWidget(self.tbl_notches)
         nr = QHBoxLayout()
         nr.setSpacing(4)
         self.btn_notch_add = QPushButton('Add')
         self.btn_notch_del = QPushButton('Remove')
         self.btn_notch_clear = QPushButton('Clear')
+        self.btn_notch_add.setToolTip(TIPS['notch_add'])
+        self.btn_notch_del.setToolTip(TIPS['notch_del'])
+        self.btn_notch_clear.setToolTip(TIPS['notch_clear'])
         for b in (self.btn_notch_add, self.btn_notch_del, self.btn_notch_clear):
             b.setObjectName('btn_small')
             nr.addWidget(b)
@@ -2837,18 +3677,24 @@ class MainWindow(QMainWindow):
         # ── 2 · High-band softening ──────────────────────────
         self.box_shelf = self._card('2 · Soften the harsh top band', 'shelf')
         self.box_shelf.setCheckable(True)
-        self.box_shelf.setToolTip('Turns the top band down (the "sizzle"). Drag the orange / red lines '
-                                  'on the spectrum with left / right mouse button.')
+        self.box_shelf.setToolTip(TIPS['shelf'])
         bs = QGridLayout(self.box_shelf.body)
         bs.setHorizontalSpacing(8)
         self.sl_sdepth, self.lbl_sdepth = self._slider_row(
-            bs, 0, 'Reduction', -48, 0, 'How much the band above the red line is turned down.', C['fade'])
-        bs.addWidget(QLabel('Fade from'), 1, 0)
+            bs, 0, 'Reduction', -48, 0,
+            TIPS['sdepth'], C['fade'])
+        lbl = QLabel('Fade from')
+        lbl.setToolTip(TIPS['fade'])
+        bs.addWidget(lbl, 1, 0)
         self.spin_fade = QDoubleSpinBox()
         bs.addWidget(self.spin_fade, 1, 1, 1, 2)
-        bs.addWidget(QLabel('Full from'), 2, 0)
+        lbl = QLabel('Full from')
+        lbl.setToolTip(TIPS['cut'])
+        bs.addWidget(lbl, 2, 0)
         self.spin_cut = QDoubleSpinBox()
         bs.addWidget(self.spin_cut, 2, 1, 1, 2)
+        self.spin_fade.setToolTip(TIPS['fade'])
+        self.spin_cut.setToolTip(TIPS['cut'])
         for sb, col in ((self.spin_fade, C['fade']), (self.spin_cut, C['cut'])):
             sb.setRange(20.0, 96000.0)
             sb.setDecimals(0)
@@ -2856,10 +3702,13 @@ class MainWindow(QMainWindow):
             sb.setSuffix(' Hz')
             sb.setKeyboardTracking(False)
             sb.setStyleSheet(f'color: {col};')
-        bs.addWidget(QLabel('Curve'), 3, 0)
+        lbl = QLabel('Curve')
+        lbl.setToolTip(TIPS['curve'])
+        bs.addWidget(lbl, 3, 0)
         self.combo_curve = QComboBox()
         for label, key in self._CURVES:
             self.combo_curve.addItem(label, key)
+        self.combo_curve.setToolTip(TIPS['curve'])
         bs.addWidget(self.combo_curve, 3, 1, 1, 2)
         bs.addWidget(_hint('Or drag the orange / red lines on the spectrum (left / right mouse).'),
                      4, 0, 1, 3)
@@ -2867,36 +3716,40 @@ class MainWindow(QMainWindow):
 
         # ── Export ───────────────────────────────────────────
         box_e = self._card('Save', 'save')
+        box_e.setToolTip(TIPS['save_card'])
         be = QVBoxLayout(box_e.body)
         er = QHBoxLayout()
         self.btn_export = QPushButton('Save')
         self.btn_export.setObjectName('btn_primary')
         self.btn_export.setEnabled(False)
+        self.btn_export.setToolTip(TIPS['save'])
         self.btn_export_diff = QPushButton('Save Removed')
         self.btn_export_diff.setEnabled(False)
-        self.btn_export_diff.setToolTip('Save only the part that was removed (original minus cleaned)')
+        self.btn_export_diff.setToolTip(TIPS['save_removed'])
         self.btn_batch = QPushButton('Save All…')
         self.btn_batch.setEnabled(False)
-        self.btn_batch.setToolTip('Clean every track in the list — choose the settings in the next window')
+        self.btn_batch.setToolTip(TIPS['batch'])
         for b in (self.btn_export, self.btn_export_diff, self.btn_batch):
             er.addWidget(b)
         be.addLayout(er)
         self.lbl_export = _hint('')
+        self.lbl_export.setToolTip(TIPS['save_card'])
         be.addWidget(self.lbl_export)
         lay.addWidget(box_e)
 
         # ── Advanced ─────────────────────────────────────────
         self.box_adv = self._card('Advanced', 'advanced')
+        self.box_adv.setToolTip(TIPS['adv'])
         ba = QGridLayout(self.box_adv.body)
         ba.setHorizontalSpacing(8)
         ba.setVerticalSpacing(6)
-        ba.addWidget(QLabel('Method'), 0, 0)
+        lbl = QLabel('Method')
+        lbl.setToolTip(TIPS['method'])
+        ba.addWidget(lbl, 0, 0)
         self.combo_method = QComboBox()
         for label, key in self._METHODS:
             self.combo_method.addItem(label, key)
-        self.combo_method.setToolTip(
-            'Static reduces the targeted bins by a fixed amount. Adaptive only removes the steady '
-            'part and lets loud moments through.')
+        self.combo_method.setToolTip(TIPS['method'])
         ba.addWidget(self.combo_method, 0, 1, 1, 3)
 
         self.adaptive_box = QWidget()
@@ -2908,61 +3761,74 @@ class MainWindow(QMainWindow):
         self.spin_oversub.setSingleStep(0.1)
         self.spin_oversub.setDecimals(1)
         self.spin_oversub.setSuffix(' ×')
-        self.spin_oversub.setToolTip('Oversubtraction: how hard the noise profile is subtracted.')
+        self.spin_oversub.setToolTip(TIPS['oversub'])
         self.spin_pct = QSpinBox()
         self.spin_pct.setRange(1, 90)
         self.spin_pct.setSuffix(' %')
-        self.spin_pct.setToolTip('Noise profile = this percentile of each bin over time.')
+        self.spin_pct.setToolTip(TIPS['pct'])
         self.spin_attack = QSpinBox()
         self.spin_attack.setRange(0, 500)
         self.spin_attack.setSuffix(' ms')
-        self.spin_attack.setToolTip('How fast the gain opens when music arrives in the bin.')
+        self.spin_attack.setToolTip(TIPS['attack'])
         self.spin_release = QSpinBox()
         self.spin_release.setRange(0, 2000)
         self.spin_release.setSuffix(' ms')
-        self.spin_release.setToolTip('How fast the gain closes again afterwards.')
+        self.spin_release.setToolTip(TIPS['release'])
         for sb in (self.spin_oversub, self.spin_pct, self.spin_attack, self.spin_release):
             sb.setKeyboardTracking(False)
-        ag.addWidget(QLabel('Oversub'), 0, 0)
-        ag.addWidget(self.spin_oversub, 0, 1)
-        ag.addWidget(QLabel('Percentile'), 0, 2)
-        ag.addWidget(self.spin_pct, 0, 3)
-        ag.addWidget(QLabel('Attack'), 1, 0)
-        ag.addWidget(self.spin_attack, 1, 1)
-        ag.addWidget(QLabel('Release'), 1, 2)
-        ag.addWidget(self.spin_release, 1, 3)
+        for i, (label, sb, key) in enumerate((('Oversub', self.spin_oversub, 'oversub'),
+                                              ('Percentile', self.spin_pct, 'pct'),
+                                              ('Attack', self.spin_attack, 'attack'),
+                                              ('Release', self.spin_release, 'release'))):
+            lbl = QLabel(label)
+            lbl.setToolTip(TIPS[key])
+            ag.addWidget(lbl, i // 2, (i % 2) * 2)
+            ag.addWidget(sb, i // 2, (i % 2) * 2 + 1)
         self.chk_smooth = QCheckBox('Smooth gain (3×3 median)')
+        self.chk_smooth.setToolTip(TIPS['smooth'])
         ag.addWidget(self.chk_smooth, 2, 0, 1, 4)
         prof = QHBoxLayout()
-        prof.addWidget(QLabel('Noise profile:'))
+        lbl = QLabel('Noise profile:')
+        lbl.setToolTip(TIPS['profile'])
+        prof.addWidget(lbl)
         self.lbl_profile = QLabel('Whole track')
         self.lbl_profile.setStyleSheet(f'color: {C["proc"]};')
+        self.lbl_profile.setToolTip(TIPS['profile'])
         prof.addWidget(self.lbl_profile, stretch=1)
         self.btn_profile_clear = QPushButton('Whole track')
         self.btn_profile_clear.setObjectName('btn_small')
         self.btn_profile_clear.setEnabled(False)
+        self.btn_profile_clear.setToolTip(TIPS['profile_clear'])
         prof.addWidget(self.btn_profile_clear)
         ag.addLayout(prof, 3, 0, 1, 4)
         ag.addWidget(_hint('Drag across a quiet part of the tone view to take the profile from there.'),
                      4, 0, 1, 4)
         ba.addWidget(self.adaptive_box, 1, 0, 1, 4)
 
-        ba.addWidget(QLabel('Stereo'), 2, 0)
+        lbl = QLabel('Stereo')
+        lbl.setToolTip(TIPS['stereo'])
+        ba.addWidget(lbl, 2, 0)
         self.combo_stereo = QComboBox()
         for label, key in self._STEREO:
             self.combo_stereo.addItem(label, key)
-        self.combo_stereo.setToolTip('The whistle is usually dead-centre while the music is wide. '
-                                     'Mid-only or coherence scaling keeps the stereo air intact.')
+        self.combo_stereo.setToolTip(TIPS['stereo'])
         ba.addWidget(self.combo_stereo, 2, 1, 1, 3)
-        ba.addWidget(QLabel('FFT size'), 3, 0)
+        lbl = QLabel('FFT size')
+        lbl.setToolTip(TIPS['fft'])
+        ba.addWidget(lbl, 3, 0)
         self.combo_res = QComboBox()
         for label, key in self._RESOLUTIONS:
             self.combo_res.addItem(label, key)
+        self.combo_res.setToolTip(TIPS['fft'])
         ba.addWidget(self.combo_res, 3, 1, 1, 3)
         self.lbl_res = _hint('')
+        self.lbl_res.setToolTip(TIPS['fft'])
         ba.addWidget(self.lbl_res, 4, 0, 1, 4)
         ba.addWidget(QLabel('Runs on'), 5, 0)
         self.lbl_device_adv = QLabel('…')
+        lbl_runs = ba.itemAtPosition(5, 0).widget()
+        lbl_runs.setToolTip(TIPS['runs_on'])
+        self.lbl_device_adv.setToolTip(TIPS['runs_on'])
         ba.addWidget(self.lbl_device_adv, 5, 1, 1, 3)
         lay.addWidget(self.box_adv)
         lay.addStretch()
@@ -3083,6 +3949,7 @@ class MainWindow(QMainWindow):
         self.spectrum.notches_edited.connect(lambda n: self._set_notches(n, manual=True))
         self.spectrum.view_changed.connect(self._sync_pan_slider)
         self.slider_pan.sliderMoved.connect(self._on_pan_slider_moved)
+        self.spectrum.view_changed.connect(self._sync_zoom_buttons)
         self.btn_zoom_full.clicked.connect(lambda: self.spectrum.set_view(*self.spectrum._zoom_xlim_full))
         self.btn_zoom_band.clicked.connect(self._zoom_tone_band)
 
@@ -3100,13 +3967,17 @@ class MainWindow(QMainWindow):
         self.btn_preset_save.clicked.connect(self._save_user_preset)
         self.btn_preset_del.clicked.connect(self._delete_user_preset)
 
-        self.list_history.itemSelectionChanged.connect(self._update_history_buttons)
+        self.list_history.itemSelectionChanged.connect(self._on_history_selected)
         self.list_history.itemDoubleClicked.connect(lambda _item: self._restore_selected_history())
-        self.btn_hist_restore.clicked.connect(self._restore_selected_history)
-        self.btn_hist_ref.clicked.connect(self._compare_history_as_a)
-        self.btn_hist_ref_clear.clicked.connect(self._clear_ref)
+        self.btn_hist_cmp.clicked.connect(self._toggle_comparison)
+        self.btn_hist_load.clicked.connect(self._restore_selected_history)
         self.btn_hist_clear.clicked.connect(self._clear_history)
         self.chk_hist_track.toggled.connect(self._on_hist_filter_toggled)
+        self.grip_history.resized.connect(lambda h: self._settings.setValue('history_height', h))
+
+        self.btn_loop.toggled.connect(self._on_loop_toggled)
+        self.btn_loop_sec.clicked.connect(self._on_loop_section_clicked)
+        self.tone_view.loop_selected.connect(self._on_loop_selected)
 
         self.box_tones.toggled.connect(lambda v: self._on_control('tones_on', bool(v)))
         self.sl_sens.valueChanged.connect(self._on_sens_changed)
@@ -3326,10 +4197,21 @@ class MainWindow(QMainWindow):
         suffix = self.name_suffix or '(none)'
         self.lbl_export.setText(f'{label} · suffix {suffix} · to output/ · change in Settings menu')
 
-    def _zoom_tone_band(self):
+    def _tone_band(self) -> tuple[float, float]:
         lo = max(self.fs.min_hz * 0.8, 1000.0)
         hi = (self.processor.bandwidth * 1.08) if self.processor.loaded else self.sample_rate / 2.0
-        self.spectrum.set_view(lo, max(hi, lo * 2))
+        full_lo, full_hi = self.spectrum._zoom_xlim_full
+        return max(lo, full_lo), min(max(hi, lo * 2), full_hi)
+
+    def _zoom_tone_band(self):
+        self.spectrum.set_view(*self._tone_band())
+
+    def _sync_zoom_buttons(self, lo: float, hi: float):
+        """Light up the button whose range is on screen; neither after a manual zoom / pan."""
+        def same(a, b):
+            return bool(abs(np.log10(a[0] / b[0])) < 0.005 and abs(np.log10(a[1] / b[1])) < 0.005)
+        self.btn_zoom_full.setChecked(same((lo, hi), self.spectrum._zoom_xlim_full))
+        self.btn_zoom_band.setChecked(not self.btn_zoom_full.isChecked() and same((lo, hi), self._tone_band()))
 
     # ── Shelf ────────────────────────────────────────────────
 
@@ -3494,10 +4376,14 @@ class MainWindow(QMainWindow):
         if not items:
             return
         path = items[0].data(Qt.ItemDataRole.UserRole)
+        if self._hist_clear == 'track' and self.current_path and path != self.current_path:
+            self._forget_track_history(self.current_path)
         self._switch_was_playing = self.is_playing
         self._stop()
         self._disable_playback_ui()
         self._proc_generation += 1       # drop any running clean for the old track
+        self._hist_generation += 1
+        self._hist_pending = None
         self._clean_debounce.stop()
         self._set_busy(f'Loading {Path(path).name} …')
 
@@ -3522,10 +4408,13 @@ class MainWindow(QMainWindow):
         self.processor    = payload['processor']
         self._audio_orig  = self.processor.audio
         self._audio_proc  = None
+        self._b, self._b_id, self._cmp = None, None, []
+        self._slot        = 1
+        self._loop_region = None
+        self.tone_view.pick_loop = False
         self.sample_rate  = payload['sr']
         self.current_path = payload['path']
         self._cb_frame    = 0
-        self._residual_boost = 1.0
 
         dur, n_ch = self.processor.duration, self.processor.n_ch
         self.lbl_track.setText(
@@ -3536,13 +4425,15 @@ class MainWindow(QMainWindow):
 
         self.spectrum.set_nyquist(self.sample_rate / 2.0)
         self.spectrum.plot_original(payload['spec_f'], payload['spec_p'])
+        self._zoom_tone_band()
         self.tone_view.set_original(self.processor.tone_view(), self.fs.min_hz - 1000.0,
                                     self.processor.bandwidth + 300.0)
         self.closeup.set_original(payload['spec_f'], self.processor.tone_prominence(),
                                   max(self.fs.min_hz - 1000.0, 1000.0), self.processor.bandwidth + 300.0)
         self._on_region_selected(None, None, reprocess=False)
         self._clear_result()
-        self._clear_ref()
+        self._update_loop()
+        self._sync_playback()
         self._refresh_history_list()
 
         self.btn_play.setEnabled(True)
@@ -3628,20 +4519,17 @@ class MainWindow(QMainWindow):
             self._detect_cache[self._detect_key()] = [dict(n) for n in payload['notches']]
             self._set_notches(payload['notches'], manual=False, reprocess=False)
 
-        self._audio_proc = proc
-        self._residual_boost = payload['boost']
+        self._hist_generation += 1       # a fresh result beats a version still being prepared
+        self._hist_pending = None
         self._set_busy(None)
-
-        self.spectrum.plot_processed(payload['psd_f'], payload['psd_proc'])
-        self.tone_view.set_processed(payload['view_proc'], payload['view_res'])
-        self.closeup.set_processed(payload['prom_proc'])
-        self._show_result(payload)
-        for b in (self.btn_ab, self.btn_solo):
-            b.setEnabled(True)
         self._update_steps(3)
         self._have_last_notches = True
         self._save_filter_settings()
-        self._record_history(payload)
+        result = self._result_of(payload)
+        entry_id = self._record_history(payload)
+        if entry_id is not None:
+            self._cache_put(entry_id, self.current_path, result)
+        self._set_b(result, entry_id)
 
         s = payload['settings']
         parts = []
@@ -3670,7 +4558,7 @@ class MainWindow(QMainWindow):
     def _show_result(self, r: dict):
         good, warn, bad = C['proc'], C['res'], C['cut']
         before, after = r['tones_before'], r['tones_after']
-        if self.fs.tones_on:
+        if r.get('tones_on', self.fs.tones_on):
             col = good if after <= max(1, before // 10) else warn if after <= before // 3 else bad
             self.lbl_tones_big.setText(f'{before} AI tones  →  {after} left')
         else:
@@ -3703,8 +4591,14 @@ class MainWindow(QMainWindow):
         data = read_json(self.HISTORY_FILE, [])
         if not isinstance(data, list):
             return []
-        return [e for e in data if isinstance(e, dict) and isinstance(e.get('id'), int)
-                and isinstance(e.get('settings'), dict) and isinstance(e.get('path'), str)]
+        entries = [e for e in data if isinstance(e, dict) and isinstance(e.get('id'), int)
+                   and isinstance(e.get('settings'), dict) and isinstance(e.get('path'), str)]
+        last: dict = {}
+        for e in sorted(entries, key=lambda e: e['id']):   # older files: number per track
+            if not isinstance(e.get('num'), int):
+                e['num'] = last.get(e['path'], 0) + 1
+            last[e['path']] = max(last.get(e['path'], 0), e['num'])
+        return entries
 
     def _save_history(self):
         err = write_json(self.HISTORY_FILE, self._history)
@@ -3723,6 +4617,11 @@ class MainWindow(QMainWindow):
 
     def _hist_entry(self, entry_id) -> dict | None:
         return next((e for e in self._history if e['id'] == entry_id), None)
+
+    def _vname(self, entry_id) -> str:
+        """Version number as shown: counted per track, from #1."""
+        e = self._hist_entry(entry_id)
+        return f'#{e["num"]}' if e else '(deleted)'
 
     @staticmethod
     def _preset_name(p) -> str:
@@ -3769,20 +4668,21 @@ class MainWindow(QMainWindow):
         short = ' · '.join(changes[:3]) + (f' · +{len(changes) - 3} more' if len(changes) > 3 else '')
         return short, changes
 
-    def _record_history(self, r: dict):
+    def _record_history(self, r: dict) -> int | None:
         if not self.current_path:
-            return
+            return None
         d = r['settings'].to_dict()
         key = self._hist_key(self.current_path, d)
         for e in self._history:
             if self._hist_key(e['path'], e['settings']) == key:
                 self._hist_current = e['id']
-                self._refresh_history_list()
-                return
+                return e['id']
         prev = self._hist_entry(self._hist_current) or (self._history[-1] if self._history else None)
         short, full = self._describe_changes(prev, self.current_path, d)
         entry = {
             'id':       self._hist_next_id,
+            'num':      max((e['num'] for e in self._history if e['path'] == self.current_path),
+                            default=0) + 1,
             'time':     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'path':     self.current_path,
             'manual':   self.current_path in self._manual_notches,
@@ -3795,10 +4695,11 @@ class MainWindow(QMainWindow):
         }
         self._hist_next_id += 1
         self._history.append(entry)
+        self._delete_versions({e['id'] for e in self._history[:-self.HISTORY_MAX]})
         del self._history[:-self.HISTORY_MAX]
         self._hist_current = entry['id']
         self._save_history()
-        self._refresh_history_list()
+        return entry['id']
 
     def _visible_history(self) -> list:
         """Oldest → newest."""
@@ -3810,7 +4711,7 @@ class MainWindow(QMainWindow):
         t = e.get('time', '')
         today = datetime.now().strftime('%Y-%m-%d')
         when = t[11:] if t.startswith(today) else t[5:16]
-        head = f'#{e["id"]}  {when}  · {self._preset_name(e["settings"].get("preset"))}'
+        head = f'#{e["num"]}  {when}  · {self._preset_name(e["settings"].get("preset"))}'
         if not self.chk_hist_track.isChecked():
             head += f'  · {Path(e["path"]).name}'
         m = e.get('metrics') or {}
@@ -3822,19 +4723,25 @@ class MainWindow(QMainWindow):
             res += f' · {self._fmt_pct(m["energy_pct"])} removed'
         if m.get('flatness') is not None:
             res += f' · {self._flatness_verdict(m["flatness"])[1]}'
-        return f'{head}\n{e.get("changes", "")}\n{res}'
+        lines = [text for key, text in (('head', head), ('changes', e.get('changes', '')), ('result', res))
+                 if self._hist_lines.get(key, True)]
+        return '\n'.join(lines) if lines else f'#{e["num"]}'
 
     def _refresh_history_list(self):
-        selected = self._selected_history_id()
+        selected = self._hist_pending if self._hist_pending is not None else self._b_id
+        cmp_ids = [r['id'] for r in self._cmp]
         lst = self.list_history
         lst.blockSignals(True)
         lst.clear()
         for e in reversed(self._visible_history()):
             marks = []
+            if e['id'] == self._b_id:
+                marks.append('B')
+            for i, cid in enumerate(cmp_ids):
+                if cid == e['id']:
+                    marks.append(self._slot_letter(i + 2))
             if e['id'] == self._hist_current:
-                marks.append('▶ current')
-            if e['id'] == self._ref_id:
-                marks.append('playing as A')
+                marks.append('settings')
             text = self._history_text(e)
             if marks:
                 text = f'[{" · ".join(marks)}]  {text}'
@@ -3842,14 +4749,15 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, e['id'])
             item.setToolTip('\n'.join(e.get('changes_full') or [e.get('changes', '')]) +
                             f'\n\n{e["path"]}')
-            if e['id'] == self._hist_current:
+            if e['id'] == self._b_id or e['id'] in cmp_ids:
                 font = item.font()
                 font.setBold(True)
                 item.setFont(font)
-                item.setForeground(QColor(C['proc']))
+                item.setForeground(QColor(C['proc'] if e['id'] == self._b_id else C['cmp']))
             lst.addItem(item)
             if e['id'] == selected:
                 item.setSelected(True)
+                lst.setCurrentItem(item)
         lst.blockSignals(False)
         self._update_history_buttons()
 
@@ -3858,10 +4766,12 @@ class MainWindow(QMainWindow):
         return items[0].data(Qt.ItemDataRole.UserRole) if items else None
 
     def _update_history_buttons(self):
-        has = self._selected_history_id() is not None
-        self.btn_hist_restore.setEnabled(has)
-        self.btn_hist_ref.setEnabled(has and self._audio_orig is not None)
-        self.btn_hist_ref_clear.setEnabled(self._ref_id is not None)
+        sel = self._selected_history_id()
+        in_cmp = sel is not None and any(r['id'] == sel for r in self._cmp)
+        self.btn_hist_cmp.setText('Remove from comparison' if in_cmp else 'Add to comparison')
+        self.btn_hist_cmp.setEnabled(in_cmp or (sel is not None and sel == self._b_id
+                                                and self._b is not None))
+        self.btn_hist_load.setEnabled(sel is not None)
         self.btn_hist_clear.setEnabled(bool(self._visible_history()))
 
     def _on_hist_filter_toggled(self, on: bool):
@@ -3888,9 +4798,19 @@ class MainWindow(QMainWindow):
         if not (same and entry.get('manual')):
             self._manual_notches.pop(self.current_path, None)
         self._save_filter_settings()
-        self._request_clean(detect=False, delay=0)
-        self._refresh_history_list()
-        self._set_status(f'Restored version #{entry["id"]}.')
+        cached = self._cache_get(entry['id'], self.current_path) if self._audio_orig is not None else None
+        if cached is not None:
+            self._clean_debounce.stop()
+            self._pending_detect = False
+            self._proc_generation += 1       # drop a clean that is still running for older settings
+            self._hist_generation += 1
+            self._hist_pending = None
+            self._set_busy(None)
+            self._set_b(cached, entry['id'])
+        else:
+            self._request_clean(detect=False, delay=0)
+            self._refresh_history_list()
+        self._set_status(f'Loaded the settings of version {self._vname(entry["id"])}.')
 
     def _history_step(self, delta: int):
         entries = self._visible_history()
@@ -3909,55 +4829,243 @@ class MainWindow(QMainWindow):
                 != QMessageBox.StandardButton.Yes:
             return
         self._history = [e for e in self._history if e['id'] not in vis]
+        self._delete_versions(vis)
+        self._drop_ids(vis)
+
+    def _drop_ids(self, vis: set):
+        """Forget deleted entries everywhere they are referenced."""
         if self._hist_current in vis:
             self._hist_current = None
+        if self._b_id in vis:
+            self._b_id = None
+        if self._hist_pending in vis:
+            self._hist_generation += 1
+            self._hist_pending = None
+            self._set_busy(None)
+        self._cmp = [r for r in self._cmp if r['id'] not in vis]
+        self._slot = min(self._slot, 1 + len(self._cmp))
         self._save_history()
+        self._sync_playback()
         self._refresh_history_list()
 
-    # ── Compare a stored version on A ────────────────────────
+    # ── Rendered versions (session temp folder) ─────────────
 
-    def _compare_history_as_a(self):
+    def _result_of(self, payload: dict) -> dict:
+        r = {k: payload[k] for k in self._RESULT_KEYS}
+        r['tones_on'] = bool(payload['settings'].tones_on)
+        return r
+
+    @staticmethod
+    def _path_tag(path: str) -> str:
+        return hashlib.md5(path.encode('utf-8')).hexdigest()[:12]
+
+    def _version_file(self, entry_id: int, path: str) -> Path:
+        return self._vdir / f'{entry_id}_{self._path_tag(path)}.pkl'
+
+    def _join_writers(self):
+        for t in self._vwriters:
+            t.join(10)
+        self._vwriters = []
+
+    def _delete_versions(self, ids: set, path: str | None = None):
+        """Delete the stored audio of these entries (and, with path, of everything rendered on that track)."""
+        if not ids and path is None:
+            return
+        self._join_writers()
+        tag = self._path_tag(path) if path else None
+        for f in list(self._vdir.glob('*.pkl')):
+            eid, _, ftag = f.stem.partition('_')
+            if (eid.isdigit() and int(eid) in ids) or ftag == tag:
+                self._vmem.pop(f, None)
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+    def _prune_versions(self):
+        """Stored audio whose history entry is gone."""
+        known = {e['id'] for e in self._history}
+        for f in list(self._vdir.glob('*.pkl')) + list(self._vdir.glob('*.tmp')):
+            eid = f.stem.partition('_')[0]
+            if f.suffix == '.tmp' or not eid.isdigit() or int(eid) not in known:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+    def _forget_track_history(self, path: str):
+        gone = {e['id'] for e in self._history if e['path'] == path}
+        self._history = [e for e in self._history if e['path'] != path]
+        self._delete_versions(gone, path)
+        self._save_history()
+        if gone:
+            self._drop_ids(gone)
+
+    @staticmethod
+    def _write_version(file: Path, result: dict):
+        tmp = file.with_suffix('.tmp')
+        try:
+            with open(tmp, 'wb') as f:
+                pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, file)
+        except OSError:
+            pass
+
+    def _remember(self, file: Path, result: dict):
+        self._vmem[file] = result
+        self._vmem.move_to_end(file)
+        while len(self._vmem) > self.VERSION_MEM:
+            self._vmem.popitem(last=False)
+
+    def _cache_put(self, entry_id: int, path: str, result: dict):
+        file = self._version_file(entry_id, path)
+        self._remember(file, result)
+        if file.exists():
+            return
+        self._vwriters = [t for t in self._vwriters if t.is_alive()]
+        t = threading.Thread(target=self._write_version, args=(file, result), daemon=True)
+        self._vwriters.append(t)
+        t.start()
+
+    def _cache_get(self, entry_id: int, path: str) -> dict | None:
+        file = self._version_file(entry_id, path)
+        r = self._vmem.get(file)
+        if r is None and file.exists():
+            try:
+                with open(file, 'rb') as f:
+                    r = pickle.load(f)
+            except Exception:
+                r = None
+        if r is None or self._audio_orig is None or r['audio'].shape != self._audio_orig.shape:
+            return None
+        self._remember(file, r)
+        return r
+
+    # ── B = the selected version ────────────────────────────
+
+    def _on_history_selected(self):
         e = self._hist_entry(self._selected_history_id())
         if e is None or self._audio_orig is None:
+            self._update_history_buttons()
+            return
+        if e['id'] == self._b_id and self._hist_pending is None:
+            self._update_history_buttons()
+            return
+        cached = self._cache_get(e['id'], self.current_path)
+        if cached is not None:
+            if self._hist_pending is not None:
+                self._hist_generation += 1
+                self._hist_pending = None
+                self._set_busy(None)
+            self._set_b(cached, e['id'])
+            self._set_status(f'B is now version {self._vname(e["id"])}.')
             return
         s = FilterSettings.from_dict(e['settings'])
         if e['path'] != self.current_path:
             s.profile_region = None
-        self._ref_generation += 1
-        if self._ref_worker and self._ref_worker.isRunning():
-            self._old_workers.append(self._ref_worker)
-        self._ref_worker = RenderWorker(self.processor, s, self._ref_generation, e['id'])
-        self._ref_worker.done.connect(self._on_ref_ready)
-        self._ref_worker.error.connect(self._on_ref_error)
-        self._ref_worker.start()
-        self._set_status(f'Preparing version #{e["id"]} for A …')
+        self._hist_generation += 1
+        self._hist_pending = e['id']
+        if self._hist_worker and self._hist_worker.isRunning():
+            self._old_workers.append(self._hist_worker)
+        self._hist_worker = CleanWorker(self.processor, s, False, self._hist_generation)
+        self._hist_worker.progress.connect(self._on_version_progress)
+        self._hist_worker.done.connect(self._on_version_rendered)
+        self._hist_worker.error.connect(self._on_version_error)
+        self._hist_worker.start()
+        self._update_history_buttons()
+        self._set_busy(f'Preparing version {self._vname(e["id"])} …')
 
-    def _on_ref_ready(self, payload: dict):
-        if payload['generation'] != self._ref_generation or self._audio_orig is None:
-            return
-        if payload['audio'].shape != self._audio_orig.shape:
-            return
-        self._audio_ref = payload['audio']
-        self._ref_id = payload['tag']
-        self._update_ab_button()
-        self._refresh_history_list()
-        self._set_status(f'A is now version #{self._ref_id}. Press Tab to switch between it and the current result.')
+    def _on_version_progress(self, msg: str, generation: int):
+        if generation == self._hist_generation and self._hist_pending is not None:
+            self._set_busy(f'Version {self._vname(self._hist_pending)}: {msg}')
 
-    def _on_ref_error(self, msg: str, generation: int):
-        if generation == self._ref_generation:
+    def _on_version_rendered(self, payload: dict):
+        if payload['generation'] != self._hist_generation or self._hist_pending is None \
+                or self._audio_orig is None or payload['audio'].shape != self._audio_orig.shape:
+            return
+        entry_id, self._hist_pending = self._hist_pending, None
+        result = self._result_of(payload)
+        self._cache_put(entry_id, self.current_path, result)
+        if not (self._clean_worker and self._clean_worker.isRunning()) \
+                and not self._clean_debounce.isActive():
+            self._set_busy(None)
+        self._set_b(result, entry_id)
+        self._set_status(f'B is now version {self._vname(entry_id)}.')
+
+    def _on_version_error(self, msg: str, generation: int):
+        if generation == self._hist_generation:
+            self._hist_pending = None
+            self._set_busy(None)
+            self._refresh_history_list()
             self._set_status(f'Could not prepare that version: {msg}')
 
-    def _clear_ref(self):
-        self._ref_generation += 1
-        self._audio_ref = None
-        self._ref_id = None
-        self._update_ab_button()
+    def _set_b(self, result: dict, entry_id: int | None):
+        self._b = result
+        self._b_id = entry_id
+        self._audio_proc = result['audio']
+        for b in (self.btn_ab, self.btn_solo):
+            b.setEnabled(True)
+        for b in (self.btn_export, self.btn_export_diff):
+            b.setEnabled(self.lbl_busy.isHidden())
+        self._sync_playback()
         self._refresh_history_list()
 
+    # ── Comparison slots C, D, … ────────────────────────────
+
+    def _toggle_comparison(self):
+        sel = self._selected_history_id()
+        if sel is None:
+            return
+        idx = next((i for i, r in enumerate(self._cmp) if r['id'] == sel), None)
+        if idx is not None:
+            playing = self._slot - 2
+            del self._cmp[idx]
+            if playing == idx:
+                self._slot = 1
+            elif playing > idx:
+                self._slot -= 1
+            self._set_status(f'Version {self._vname(sel)} removed from the comparison.')
+        elif sel == self._b_id and self._b is not None:
+            self._cmp.append({**self._b, 'id': sel})
+            self._set_status(f'Version {self._vname(sel)} is now on {self._slot_letter(1 + len(self._cmp))}. '
+                             'Tab steps through A, B and the comparison.')
+        else:
+            return
+        self._sync_playback()
+        self._refresh_history_list()
+
+    @staticmethod
+    def _slot_letter(slot: int) -> str:
+        return chr(ord('A') + slot)
+
+    def _slot_label(self) -> tuple[str, str]:
+        if self._slot == 0:
+            return 'A  Original', 'btn_ab_a'
+        if self._slot == 1:
+            return (f'B  Version {self._vname(self._b_id)}' if self._b_id is not None else 'B  Cleaned'), 'btn_ab_b'
+        return f'{self._slot_letter(self._slot)}  Version {self._vname(self._cmp[self._slot - 2]["id"])}', 'btn_ab_x'
+
+    def _shown_result(self) -> dict | None:
+        return self._cmp[self._slot - 2] if self._slot >= 2 else self._b
+
+    def _sync_playback(self):
+        """Point playback, the result panel and the plots at the current slot."""
+        if self._slot >= 2 + len(self._cmp):
+            self._slot = 1
+        r = self._shown_result()
+        self._audio_play = None if self._slot == 0 or r is None else r['audio']
+        self._audio_solo = None if r is None else r['audio']
+        self._solo_boost = 1.0 if r is None else r['boost']
+        if r is not None:
+            self.spectrum.plot_processed(r['psd_f'], r['psd_proc'])
+            self.tone_view.set_processed(r['view_proc'], r['view_res'])
+            self.closeup.set_processed(r['prom_proc'])
+            self._show_result(r)
+        self._update_ab_button()
+        self._update_view_mode()
+
     def _update_ab_button(self):
-        label, obj = self._AB_LABELS[self._ab_mode]
-        if self._ab_mode == 0 and self._ref_id is not None:
-            label = f'A  Version #{self._ref_id}'
+        label, obj = self._slot_label()
         self.btn_ab.setText(label)
         self.btn_ab.setObjectName(obj)
         self.style().unpolish(self.btn_ab)
@@ -3967,42 +5075,87 @@ class MainWindow(QMainWindow):
 
     def _audio_callback(self, outdata: np.ndarray, frames: int, _time, _status):
         orig  = self._audio_orig
-        proc  = self._audio_proc
-        ref   = self._audio_ref
-        mode  = self._ab_mode
+        play  = self._audio_play
+        rem   = self._audio_solo
         solo  = self._solo_residual
         vol   = self._cb_volume
+        loop  = self._cb_loop
 
         if orig is None:
             outdata.fill(0.0)
             return
 
-        frame = self._cb_frame
-        end   = min(frame + frames, orig.shape[0])
-        avail = end - frame
+        total = orig.shape[0]
+        lo, hi = loop if loop else (0, total)
+        pos = self._cb_frame
+        if loop and not lo <= pos < hi:
+            pos = lo
+        filled = 0
+        while filled < frames:
+            end = min(pos + frames - filled, hi)
+            if end <= pos:
+                outdata[filled:].fill(0.0)
+                self._cb_playing = False
+                break
+            o = orig[pos:end]
+            if solo and rem is not None and rem.shape == orig.shape:
+                chunk = (o - rem[pos:end]) * (self._solo_boost * vol)
+            elif play is not None and play.shape == orig.shape:
+                chunk = play[pos:end] * vol
+            else:
+                chunk = o * vol
+            outdata[filled:filled + end - pos] = chunk
+            filled += end - pos
+            pos = end
+            if loop and pos >= hi:
+                pos = lo
+        self._cb_frame = pos
 
-        if avail <= 0:
-            outdata.fill(0.0)
-            self._cb_playing = False
-            return
+    # ── Loop ──────────────────────────────────────────────────
 
-        o = orig[frame:end]
-        if solo and proc is not None and proc.shape == orig.shape:
-            chunk = (o - proc[frame:end]) * (self._residual_boost * vol)
-        elif mode == 1 and proc is not None and proc.shape == orig.shape:
-            chunk = proc[frame:end] * vol
-        elif ref is not None and ref.shape == orig.shape:
-            chunk = ref[frame:end] * vol
+    def _update_loop(self):
+        """Frame range the callback wraps in, plus the loop controls."""
+        orig, r = self._audio_orig, self._loop_region
+        if not self._loop_on or orig is None:
+            self._cb_loop = None
+        elif r:
+            lo = int(np.clip(r[0] * self.sample_rate, 0, orig.shape[0] - 1))
+            self._cb_loop = (lo, max(lo + 1, min(int(r[1] * self.sample_rate), orig.shape[0])))
         else:
-            chunk = o * vol
+            self._cb_loop = (0, orig.shape[0])
+        self.tone_view.set_loop(r)
+        armed = self.tone_view.pick_loop
+        self.btn_loop_sec.setText('Clear Section' if r else 'Pick a section …' if armed else 'Loop Section')
+        self.lbl_loop.setText(f'{fmt_time(r[0], True)} – {fmt_time(r[1], True)}' if r else '')
 
-        if avail < frames:
-            outdata[:avail] = chunk
-            outdata[avail:].fill(0.0)
-            self._cb_playing = False
+    def _on_loop_toggled(self, on: bool):
+        self._loop_on = bool(on)
+        self._settings.setValue('loop_on', self._loop_on)
+        self._update_loop()
+
+    def _on_loop_section_clicked(self):
+        if self._loop_region:
+            self._loop_region = None
+            self._set_status('Loop section cleared.')
+        elif self.tone_view.pick_loop:
+            self.tone_view.pick_loop = False
+            self._set_status('')
         else:
-            outdata[:] = chunk
-        self._cb_frame = end
+            self.tone_view.pick_loop = True
+            self.btn_view_lines.setChecked(True)
+            self.lower_stack.setCurrentIndex(1)
+            self._set_status('Drag across the Tone lines view to pick the section to loop.')
+        self._update_loop()
+
+    def _on_loop_selected(self, t0: float, t1: float):
+        self.tone_view.pick_loop = False
+        self._loop_region = (float(t0), float(t1))
+        if not self.btn_loop.isChecked():
+            self.btn_loop.setChecked(True)   # → _update_loop
+        self._update_loop()
+        if self._audio_orig is not None and not self._cb_loop[0] <= self._cb_frame < self._cb_loop[1]:
+            self._seek_to(self._cb_loop[0])
+        self._set_status(f'Looping {fmt_time(t0, True)} – {fmt_time(t1, True)}.')
 
     # ── Playback control ──────────────────────────────────────
 
@@ -4066,16 +5219,16 @@ class MainWindow(QMainWindow):
         self.tone_view.set_playhead(0.0)
 
     def _toggle_ab(self):
-        """Toggle A ↔ B. If solo is active, Tab exits solo first. Stream keeps running."""
+        """Step A → B → C … → A. If solo is active, Tab exits solo first. Stream keeps running."""
         if self._audio_proc is None:
             return
         if self._solo_residual:
             self._solo_residual = False
             self.btn_solo.setChecked(False)
+            self._update_view_mode()
         else:
-            self._ab_mode = 1 - self._ab_mode
-            self._update_ab_button()
-        self._update_view_mode()
+            self._slot = (self._slot + 1) % (2 + len(self._cmp))
+            self._sync_playback()
 
     def _toggle_solo_residual(self):
         if self._audio_proc is None:
@@ -4086,12 +5239,13 @@ class MainWindow(QMainWindow):
 
     def _update_view_mode(self):
         """Frame colour + tone view follow what you are hearing."""
-        mode = 'res' if self._solo_residual else ('proc' if self._ab_mode == 1 else 'orig')
+        mode = ('res' if self._solo_residual else 'orig' if self._slot == 0 else
+                'proc' if self._slot == 1 else 'cmp')
         self.view_frame.setStyleSheet(
             f'QFrame#view_frame {{ border: 2px solid {self._MODE_COLORS[mode]}; border-radius: 8px; }}')
-        self.tone_view.set_view(mode)
+        self.tone_view.set_view('proc' if mode == 'cmp' else mode)
         if self._audio_proc is not None:
-            self._update_steps(4 if mode != 'orig' or self._ab_mode == 0 else 3)
+            self._update_steps(4)
 
     # ── Pan slider sync ───────────────────────────────────────
 
@@ -4273,7 +5427,7 @@ class MainWindow(QMainWindow):
             s = loaded
 
         self.btn_batch.setText('Cancel batch')
-        self.btn_batch.setToolTip('Stop after the track that is being cleaned now')
+        self.btn_batch.setToolTip(TIPS['batch_stop'])
         self._batch_worker = BatchWorker(
             dlg.paths(), s,
             {k: [dict(n) for n in v] for k, v in manual.items()} if dlg.keep_manual() else {},
@@ -4286,7 +5440,7 @@ class MainWindow(QMainWindow):
     def _on_batch_done(self, msg: str):
         self.btn_batch.setEnabled(True)
         self.btn_batch.setText('Save All…')
-        self.btn_batch.setToolTip('Clean every track in the list — choose the settings in the next window')
+        self.btn_batch.setToolTip(TIPS['batch'])
         self._set_status('Batch complete.')
         QMessageBox.information(self, 'Batch', msg)
 
@@ -4310,10 +5464,17 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._close_stream()
         self._save_filter_settings()
-        for w in [self._load_worker, self._clean_worker, self._batch_worker, self._ref_worker,
+        for w in [self._load_worker, self._clean_worker, self._batch_worker, self._hist_worker,
                   *self._old_workers]:
             if w and w.isRunning():
                 w.wait(5000)
+        self._join_writers()
+        if self._hist_clear == 'close':
+            self._history = []
+            self._save_history()
+            shutil.rmtree(self._vdir, ignore_errors=True)
+        elif self._hist_clear == 'track' and self.current_path:
+            self._forget_track_history(self.current_path)
         super().closeEvent(event)
 
 
@@ -4322,6 +5483,7 @@ class MainWindow(QMainWindow):
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    RichToolTip(app)
     app_icon = QIcon(str(Path(__file__).resolve().parent / 'assets' / 'frequency_cleaner.png'))
     app.setWindowIcon(app_icon)
     win = MainWindow()
