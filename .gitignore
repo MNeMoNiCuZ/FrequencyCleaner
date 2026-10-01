@@ -250,4 +250,5 @@ presets/
 history.json
 venv_activate.bat
 FrequencyCleaner*zip
+FrequencyCleaner*7z
 history_versions/
