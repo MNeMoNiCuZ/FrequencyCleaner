@@ -249,6 +249,5 @@ output*/
 presets/
 history.json
 venv_activate.bat
-FrequencyCleaner.zip
-FrequencyCleaner-CPU.zip
+FrequencyCleaner*zip
 history_versions/
