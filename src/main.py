@@ -1043,7 +1043,14 @@ class FilterProcessor:
         if torch is not None:
             try:
                 win = GPU.window(nperseg)
-                Z = torch.stft(GPU.tensor(x), nperseg, self._hop(nperseg),
+                hop = self._hop(nperseg)
+                samples = GPU.tensor(x)
+                # scipy.stft pads to a complete final hop. Match that frame on
+                # CUDA too: adaptive percentiles depend on the full frame set.
+                tail = (-len(x)) % hop
+                if tail:
+                    samples = torch.nn.functional.pad(samples, (0, tail))
+                Z = torch.stft(samples, nperseg, hop,
                                window=win, center=True, pad_mode='constant', return_complex=True)
                 band = Z.index_select(0, torch.from_numpy(rows).to('cuda'))
                 band = (band / float(win.sum())).cpu().numpy()

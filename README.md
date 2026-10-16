@@ -4,7 +4,7 @@ An audio cleaner with a live spectrum, editable EQ curves, and automatic detecti
 
 Outliers are found by comparing the spectrum to its local median floor. Frequency limits, prominence, local median span, maximum peak width, time percentile, minimum level, notch width cap, and count limit are adjustable. A second pass can catch leftovers. Filtering uses overlap-add STFT processing, applied per channel, to mid only, or weighted by stereo coherence. Automatic outlier removal supports fixed reduction or adaptive spectral subtraction; EQ curves use per-frame dynamic gain by default, with a fixed-gain option for each band.
 
-Input: MP3, WAV, FLAC, OGG, AIFF, M4A, MP4, AAC, Opus. Output: WAV 24-bit, WAV 32-bit float, FLAC 24-bit or MP3 320 kbps.
+Input: MP3, WAV, FLAC, OGG, AIFF, M4A, MP4, AAC, Opus. Output: WAV 24-bit, WAV 32-bit float, FLAC 24-bit or MP3 320 kbps. **Same as input** preserves WAV, FLAC, AIFF and MP3 containers; other inputs become FLAC 24-bit.
 
 | Entry point | Description |
 |---|---|
@@ -12,7 +12,18 @@ Input: MP3, WAV, FLAC, OGG, AIFF, M4A, MP4, AAC, Opus. Output: WAV 24-bit, WAV 3
 | `FrequencyCleaner-GPU.exe` | CUDA build (NVIDIA GPU) |
 | `launch_app_venv.bat` | Run from source using the venv |
 
-## Install
+## Download and run
+
+Download a Windows build from [Releases](https://github.com/MNeMoNiCuZ/FrequencyCleaner/releases). Extract the entire archive to a writable folder before launching the executable. The portable builds include Python and their dependencies; a separate Python installation is only needed to run from source.
+
+- **CPU:** keep `FrequencyCleaner.exe` beside its `_internal` folder.
+- **GPU:** extract `FrequencyCleaner-GPU.7z` with [7-Zip](https://www.7-zip.org/), and keep `FrequencyCleaner-GPU.exe` beside its `_internal_gpu` folder. This build bundles CUDA-enabled PyTorch and needs a compatible NVIDIA GPU and current NVIDIA driver for acceleration. There is no separate CUDA toolkit installation step.
+
+Do not move the executable away from its runtime folder. The application creates `input`, `output`, saved presets and history beside the executable as needed. Exported audio goes to `output` by default. App preferences and each track's configuration persist between launches.
+
+GPU processing is controlled in **Settings > General**. The status bar shows the selected compute device. Processing falls back to the CPU when CUDA is unavailable or a GPU operation fails. Optional formats decoded through ffmpeg also require `ffmpeg` and `ffprobe` on PATH.
+
+## Run from source
 
 Requires Python 3.10+ on Windows. The app runs from a virtual environment named `venv` in the project folder.
 
@@ -39,7 +50,7 @@ Optional:
 2. Load a track, or place tracks in the `input` folder.
 3. Choose Gentle, Normal or Strong from the preset dropdown beside the processing mode. Saved presets appear there too; manage them in Settings > Processing. In EQ mode these strengths regenerate automatic dynamic bands and keep manual bands.
 4. Use **+ Add curve** to choose a shape, or double-click the spectrum. Select **Soften highs** for broad high-frequency attenuation, with start, end and depth controls.
-5. Open **Outliers** to tune automatic detection. Detector changes run a fresh detection.
+5. Use **Settings > Outliers** or the top-bar **Outliers** inspector to tune automatic detection. Detector changes run a fresh detection. The **Outliers** display tab shows the frequency analysis.
 6. Compare with A/B, then export to the `output` folder or batch process all tracks.
 
 ### One live display
@@ -90,11 +101,25 @@ The response used for playback and export varies throughout the track. Rendered 
 
 Detector settings remain editable while **Fixed cuts** is off. That checkbox enables the legacy automatic notch stage; automatic dynamic bands replace it by default. **Show fixed cuts** (previously Auto cuts) only displays the response of that stage. It does not enable filtering or create dynamic bands.
 
+### Presets, history and export
+
+| Preset | Outlier detection | Soften highs |
+|---|---|---|
+| Gentle | Stronger outliers, one pass | Starts at 15 kHz, up to -6 dB |
+| Normal | Two passes | Starts at 14 kHz, up to -12 dB |
+| Strong | Also includes fainter outliers, two passes | Starts at 12 kHz, up to -24 dB |
+
+Presets are editable starting settings. In EQ mode, choosing a strength refreshes the automatic dynamic bands while preserving manually edited bands. Save and manage your own presets in **Settings > Processing**; they also appear in the main preset dropdown. The broad top-band reductions apply when **Soften highs** is selected.
+
+**History** stores rendered versions and their settings. Select a version to hear it as B, double-click it to restore its settings, or add older versions to comparison slots C, D and onward. Tab cycles through A (original), B and any comparison slots. **Residual** or R auditions the sound removed by the selected processed version. Undo/redo steps through the current track's history. History retention and displayed details are configured in **Settings > History**.
+
+The **Save** menu exports cleaned audio, removed audio, or opens batch export. **Settings > Export** controls the format and filename suffix. Batch export lets you choose tracks, current settings or a preset, per-track detection or a shared fixed-cut list, output folder and format, and whether to save removed audio too. Tracks with manually edited fixed cuts can retain their own lists.
+
 ### Detection rules
 
 The previous **600 Hz** median span and **40 Hz** maximum peak width were heuristics, not universal constants. They remain the starting values and can now be edited. The time percentile defaults to **50%** (median over time); lower values favour more persistent tones, while higher values include more intermittent peaks. Minimum level is relative to the maximum of the track's median spectrum, not absolute dBFS.
 
-The analyzer tab (**Settings > Analyzer**) defaults to smoother 1/12-octave display and offers fine, normal, or smooth fractional-octave smoothing, an EQ gain range, and peak reset. Its 32768-point FFT interpolates bass bins smoothly; only the visualization is smoothed. Outlier detection uses the track's longer-window time statistics (about 2.9 Hz per bin at typical sample rates), so narrow artifacts are easier to inspect in **Outlier detail**.
+The analyzer tab (**Settings > Analyzer**) defaults to smoother 1/12-octave display and offers fine, normal, or smooth fractional-octave smoothing, an EQ gain range, and peak reset. Its 32768-point FFT interpolates bass bins smoothly; only the visualization is smoothed. Outlier detection uses the track's longer-window time statistics (about 2.9 Hz per bin at typical sample rates), so narrow artifacts are easier to inspect in **Outliers**.
 
 The analyzer uses native Qt painting with cached axes and EQ regions. A precise 6 ms timer targets **166 Hz**. The capture tool can measure full painting, timer pacing and grouped dragging without an audio device:
 
@@ -109,6 +134,7 @@ The analyzer uses native Qt painting with cached axes and EQ regions. A precise 
 | Space | Play / pause |
 | Tab | A/B toggle |
 | R | Solo residual |
+| L | Toggle loop |
 | Left / Right | Seek 5 s |
 | Ctrl+Z | Undo |
 | Ctrl+Y / Ctrl+Shift+Z | Redo |
@@ -122,10 +148,26 @@ build_gpu.bat
 
 `build_gpu.bat` requires CUDA-enabled PyTorch in the venv.
 
+### Package a GPU release
+
+Install 7-Zip, build the GPU executable, then run:
+
+```powershell
+.\package_gpu.ps1
+```
+
+To package a staged build instead of the executables in the project root:
+
+```powershell
+.\package_gpu.ps1 -BuildDirectory .\build_gpu_tmp\release\dist\FrequencyCleaner-GPU
+```
+
+The script creates `release/FrequencyCleaner-GPU.7z` and a matching `.sha256` checksum. It includes only the GPU executable, `_internal_gpu`, README and license, using solid LZMA2 compression with a 256 MiB dictionary. Tracks, presets, history and development artifacts are excluded. It verifies the archive's integrity and requires the result to be below GitHub's 2 GiB per-asset limit. Outputs stay out of Git. Compression defaults to 16 threads; use `-Threads 4` on machines with less memory. A staging directory or alternative 7-Zip installation can be selected with `-BuildDirectory`, `-OutputDirectory` and `-SevenZipPath`.
+
 ## UI previews
 
-Run `venv\Scripts\python.exe tests/capture_ui.py --output artifacts/ui/workspace.png` to capture the populated Qt workspace using a track from `input/`. The capture uses isolated app state and real audio/detection, without opening the audio device. Add `--width 1280 --height 820 --inspector outliers`, `--shape-menu`, or `--scrub` to inspect other states.
+Run `venv\Scripts\python.exe tests/capture_ui.py --output artifacts/ui/workspace.png` to capture the populated Qt workspace using a track from `input/`. The capture uses isolated app state and real audio/detection, without opening the audio device. Add `--width 1280 --height 820 --inspector outliers`, `--shape-menu`, or `--scrub` to inspect other states. Use `--view outliers` or `--view spectrogram` for the other displays; `--animate` records playback-position changes. `--settings-menu --settings-tab Appearance` captures the actual settings modal, and `--move-editor` checks the floating panel.
 
 ## Verification
 
-Run `venv\Scripts\python.exe -m unittest discover -s tests -v` for DSP and offscreen desktop interaction checks. Tests use temporary settings/history, synthetic audio, and no audio output device.
+Run `venv\Scripts\python.exe -m unittest discover -s tests -v` for DSP and offscreen desktop interaction checks. Tests use temporary settings/history, synthetic audio, and no audio output device. When CUDA is available, the suite also compares CPU and GPU output for fixed and dynamic EQ, fixed and adaptive notches, and high-band softening, including tracks ending with a partial STFT frame.

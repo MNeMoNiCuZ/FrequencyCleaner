@@ -1028,5 +1028,46 @@ class DesktopTests(unittest.TestCase):
         self.assertIsNotNone(w.spectrum._peak_db)
 
 
+class GPUParityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not main.GPU.available():
+            raise unittest.SkipTest('CUDA is unavailable')
+
+    def test_cpu_cuda_match_including_partial_final_frame(self):
+        sr = 48000
+        t = np.arange(sr * 3 + 137) / sr
+        x = (.12 * np.sin(2 * np.pi * 1000 * t)
+             + np.where(t < 1.5, .08, .015) * np.sin(2 * np.pi * 8000 * t))
+        audio = np.column_stack((x, -.8 * x)).astype(np.float32)
+        base = main.FilterSettings(tones_on=False, shelf_on=False, auto_eq=False)
+        notches = [dict(freq=8000, width=20, on=True)]
+        cases = {
+            'fixed_eq': replace(base, eq_curves=[normalize_curve(
+                dict(freq=1000, gain=-12, width=1, dynamic=False))]),
+            'dynamic_eq': replace(base, eq_curves=[normalize_curve(
+                dict(freq=8000, gain=-18, width=.65, threshold=-40, ratio=4, dynamic=True))]),
+            'fixed_notches': replace(base, tones_on=True, notches=notches),
+            'adaptive_notches': replace(base, tones_on=True, notches=notches, method='adaptive'),
+            'soften_highs': replace(base, edit_mode='range', shelf_on=True,
+                                    fade_start=6000, cutoff=10000, shelf_depth_db=-12),
+        }
+        saved_enabled, saved_error = main.GPU.enabled, main.GPU.last_error
+        try:
+            for name, settings in cases.items():
+                with self.subTest(stage=name):
+                    outputs = []
+                    for enabled in (False, True):
+                        main.GPU.enabled = enabled
+                        main.GPU.last_error = ''
+                        processor = main.FilterProcessor()
+                        processor.load(audio, sr)
+                        outputs.append(processor.apply(settings))
+                        self.assertEqual(main.GPU.last_error, '', 'Unexpected CPU fallback')
+                    np.testing.assert_allclose(outputs[1], outputs[0], atol=1e-6, rtol=1e-4)
+        finally:
+            main.GPU.enabled, main.GPU.last_error = saved_enabled, saved_error
+
+
 if __name__ == '__main__':
     unittest.main()

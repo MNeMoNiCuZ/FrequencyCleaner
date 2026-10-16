@@ -219,6 +219,7 @@ __marimo__/
 
 
 # Build output
+/release/
 build_tmp/
 build_gpu_tmp/
 build/
