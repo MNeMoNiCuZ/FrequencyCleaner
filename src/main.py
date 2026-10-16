@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-FrequencyCleaner — AI Music Artifact Remover
-Removes the "AI sound" from generated music: the dozens of steady,
-narrow high-frequency tones these generators leave behind (removed with
-notches), plus optional softening of the harsh top band (a high shelf).
+FrequencyCleaner — Spectral Outlier Cleaner
+Finds narrow spectral outliers and removes them with notch filters,
+with editable spectral EQ curves and optional high-band softening.
 """
 
 import os
@@ -50,6 +49,9 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from scipy import signal, ndimage
+from filter_curves import CURVE_TYPES, normalize_curve, curve_gain_db, combined_gain_db
+from dynamic_eq import band_levels, activity_envelope, response_at
+from live_spectrum import LiveSpectrumMixin
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -58,8 +60,8 @@ from PyQt6.QtWidgets import (
     QFrame, QSizePolicy, QStyle, QStyleOptionSlider,
     QDialog, QDialogButtonBox, QFormLayout, QLineEdit,
     QDoubleSpinBox, QSpinBox, QCheckBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QScrollArea, QSplitter,
-    QGridLayout, QButtonGroup, QProgressBar, QRadioButton, QStackedWidget, QInputDialog,
+    QHeaderView, QAbstractItemView, QScrollArea,
+    QGridLayout, QButtonGroup, QProgressBar, QRadioButton, QStackedWidget, QInputDialog, QMenu, QTabWidget,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QSettings, QEvent, QObject, QPoint
 from PyQt6.QtGui import (QShortcut, QKeySequence, QColor, QIcon, QPixmap, QPainter,
@@ -70,6 +72,7 @@ import matplotlib
 matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.ticker import FuncFormatter, LogFormatter
 
 
@@ -248,10 +251,10 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 """.replace('@CHECK@', (Path(__file__).resolve().parent / 'icons' / 'check.svg').as_posix())
 
 C = {
-    'bg':   '#1e1e2e', 'ax_bg': '#181825',
+    'bg':   '#202020', 'ax_bg': '#181818',
     'orig': '#89b4fa', 'proc':  '#a6e3a1', 'res': '#f9e2af',
     'fade': '#fab387', 'cut':   '#f38ba8', 'off': '#6c7086',
-    'grid': '#313244', 'text':  '#cdd6f4', 'cmp':   '#cba6f7',
+    'grid': '#383838', 'text':  '#cccccc', 'cmp':   '#d4b97c',
     'loop': '#89dceb',
 }
 
@@ -373,13 +376,25 @@ def write_json(path: Path, data) -> str | None:
 class FilterSettings:
     preset:         str   = 'normal'     # 'gentle' | 'normal' | 'strong' | 'custom'
 
-    # AI tones (narrow steady peaks → notches)
+    # spectral outliers (narrow steady peaks → notches)
     tones_on:       bool  = True
     threshold_db:   float = 4.0          # a peak this far above the local floor is a tone
     min_hz:         float = 5000.0       # search for tones above this frequency
     second_pass:    bool  = True         # re-detect on the cleaned result to catch leftovers
     tone_depth_db:  float = -40.0
     notches:        list  = field(default_factory=list)   # [{'freq', 'width', 'on', 'prom'}]
+    floor_hz:       float = 600.0
+    max_fwhm_hz:    float = 40.0
+    max_hz:         float = 24000.0
+    min_level_db:   float = -90.0
+    steady_pct:     float = 50.0
+    notch_cap_hz:   float = 30.0
+    max_outliers:   int   = 400
+
+    edit_mode:      str   = 'curves'
+    eq_curves:      list  = field(default_factory=list)
+    auto_eq:        bool  = True
+    auto_min_width: float = .65          # minimum automatic band width, octaves
 
     # High-band softening (shelf)
     shelf_on:       bool  = True
@@ -413,9 +428,21 @@ class FilterSettings:
             return cls()
         if not isinstance(data, dict):
             return cls()
+        # Startup adopts the new default editor; old saved presets/history keep
+        # their range processing when restored through from_dict below.
+        data.setdefault('edit_mode', 'curves')
+        old_eq = isinstance(data.get('eq_curves'), list) and any(
+            isinstance(c, dict) and 'dynamic' not in c for c in data['eq_curves'])
+        if old_eq and data['edit_mode'] == 'curves':
+            data['eq_curves'] = [{**c, 'dynamic':c.get('dynamic', True)} for c in data['eq_curves'] if isinstance(c, dict)]
         s = cls.from_dict({k: v for k, v in data.items() if k not in cls._TRANSIENT})
         if s.preset in PRESETS:
             s.apply_preset(s.preset)
+        if s.edit_mode == 'curves':
+            if old_eq:
+                s.tones_on = False
+            elif 'tones_on' in data:
+                s.tones_on = bool(data['tones_on'])
         return s
 
     def to_dict(self, notches: bool = True) -> dict:
@@ -433,6 +460,8 @@ class FilterSettings:
         s = cls()
         if not isinstance(data, dict):
             return s
+        if 'edit_mode' not in data and any(k in data for k in ('shelf_on', 'fade_start', 'cutoff')):
+            s.edit_mode = 'range'
         names = {f.name for f in fields(cls)}
         for k, v in data.items():
             if k not in names:
@@ -440,6 +469,9 @@ class FilterSettings:
             if k == 'notches':
                 if isinstance(v, list):
                     s.notches = [dict(n) for n in v if isinstance(n, dict) and 'freq' in n and 'width' in n]
+            elif k == 'eq_curves':
+                if isinstance(v, list):
+                    s.eq_curves = [normalize_curve({**c, 'dynamic':c.get('dynamic', False)}) for c in v if isinstance(c, dict)]
             elif k == 'profile_region':
                 try:
                     s.profile_region = (float(v[0]), float(v[1])) if v else None
@@ -450,6 +482,14 @@ class FilterSettings:
                     setattr(s, k, type(getattr(s, k))(v))
                 except (TypeError, ValueError):
                     pass
+        for name, lo, hi in [('floor_hz', 20, 5000), ('max_fwhm_hz', 3, 1000),
+                             ('max_hz', 20, 96000), ('min_level_db', -140, -20),
+                             ('steady_pct', 10, 90), ('notch_cap_hz', 3, 1000),
+                             ('max_outliers', 1, 2000)]:
+            value = getattr(s, name)
+            setattr(s, name, type(value)(np.clip(value, lo, hi)) if np.isfinite(value) else getattr(cls(), name))
+        if s.edit_mode not in ('curves', 'range'):
+            s.edit_mode = 'curves'
         return s
 
     def apply_preset(self, name: str):
@@ -458,37 +498,37 @@ class FilterSettings:
             setattr(self, k, v)
 
     def copy(self) -> 'FilterSettings':
-        return replace(self, notches=[dict(n) for n in self.notches])
+        return replace(self, notches=[dict(n) for n in self.notches],
+                       eq_curves=[dict(c) for c in self.eq_curves])
 
 
 PRESETS = {
     'gentle': {
         'label': 'Gentle',
-        'text':  'Removes the clearer AI tones (one pass) and takes a light edge off the very top '
-                 '(from 15 kHz).',
+        'text':  'Stronger outliers only, one pass. In Soften highs mode: a light top-band cut from 15 kHz.',
         'values': dict(tones_on=True, threshold_db=5.0, min_hz=5000.0, second_pass=False,
                        tone_depth_db=-35.0, shelf_on=True, fade_start=15000.0, cutoff=18500.0,
                        shelf_depth_db=-6.0, method='static'),
     },
     'normal': {
         'label': 'Normal',
-        'text':  'Removes all AI tones (two passes) and softens the harsh top band a little '
-                 '(from 14 kHz).',
+        'text':  'Detect narrow outliers in two passes. In Soften highs mode: soften the top band from 14 kHz.',
         'values': dict(tones_on=True, threshold_db=4.0, min_hz=5000.0, second_pass=True,
                        tone_depth_db=-40.0, shelf_on=True, fade_start=14000.0, cutoff=18000.0,
                        shelf_depth_db=-12.0, method='static'),
     },
     'strong': {
         'label': 'Strong',
-        'text':  'Also catches faint tones and tames the top band hard (from 12 kHz). '
-                 'Can dull cymbals — compare with A/B.',
+        'text':  'Also catches faint outliers. In Soften highs mode: a stronger cut from 12 kHz. Compare with A/B.',
         'values': dict(tones_on=True, threshold_db=3.0, min_hz=4000.0, second_pass=True,
                        tone_depth_db=-60.0, shelf_on=True, fade_start=12000.0, cutoff=17000.0,
                        shelf_depth_db=-24.0, method='static'),
     },
 }
 PRESET_FIELDS = set(PRESETS['normal']['values'])
-DETECT_FIELDS = {'tones_on', 'threshold_db', 'min_hz', 'second_pass'}
+DETECT_FIELDS = {'tones_on', 'threshold_db', 'min_hz', 'second_pass', 'floor_hz',
+                 'max_fwhm_hz', 'max_hz', 'min_level_db', 'steady_pct',
+                 'notch_cap_hz', 'max_outliers'}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -655,11 +695,7 @@ class FilterProcessor:
     STFT_OVERLAP  = 3       # 75 % overlap (hop = nperseg / 4)
     WEIGHT_EPS    = 1e-3
 
-    FLOOR_HZ          = 600.0   # span of the local spectral floor
     MIN_LEVEL_DB      = -90.0   # below this (relative to peak) is codec silence
-    TONE_MAX_FWHM_HZ  = 40.0    # wider than this is not a tone
-    TONE_MAX_WIDTH_HZ = 30.0    # notch width cap
-    TONE_MAX_COUNT    = 400
 
     def __init__(self):
         self._audio    = None   # (N, ch) float32
@@ -673,6 +709,7 @@ class FilterProcessor:
         self._audible  = None
         self.bandwidth = 0.0    # highest frequency with real content (e.g. MP3 lowpass)
         self._view     = None
+        self._detection_cache = {}
 
     # ── Properties ───────────────────────────────────────────
 
@@ -702,6 +739,7 @@ class FilterProcessor:
         if audio.ndim != 2 or audio.shape[0] < 4096:
             raise ValueError('Audio is too short to analyse')
         self._audio = np.ascontiguousarray(audio, dtype=np.float32)
+        self._detection_cache = {}
         self._sr    = int(sr)
         self._n_ch  = audio.shape[1]
         self._mono  = self._audio.mean(axis=1) if self._n_ch > 1 else self._audio[:, 0]
@@ -721,7 +759,7 @@ class FilterProcessor:
         white = db - self._floor[rows][:, None] + self._psd_ref
         offset = np.median(white, axis=0, keepdims=True)
         self._view = {'rows': rows, 'offset': offset, 'extent': extent,
-                      'orig': self._pool(white - offset)}
+                      'orig': self._pool(white - offset), 'db': db}
 
     # ── Resolution helpers ───────────────────────────────────
 
@@ -767,8 +805,13 @@ class FilterProcessor:
             GPU.fail(e)
             return None
 
-    def _welch(self, x: np.ndarray) -> tuple:
+    def _welch(self, x: np.ndarray, percentile: float = 50.0) -> tuple:
         nperseg = self._fit(self.pow2_for(self._sr, self.TONE_RES_HZ), len(x))
+        if percentile != 50.0:
+            f, _, psd = signal.spectrogram(x, self._sr, window='hann', nperseg=nperseg,
+                                           noverlap=nperseg // 2, mode='psd')
+            psd = np.percentile(psd, percentile, axis=1) / -np.log(1. - percentile / 100.)
+            return f, 10.0 * np.log10(psd + 1e-20)
         p = self._psd_frames_gpu(x, nperseg, nperseg // 2)
         if p is not None:
             k = p.shape[0]
@@ -781,11 +824,11 @@ class FilterProcessor:
             f, psd = signal.welch(x, self._sr, window='hann', nperseg=nperseg, average='median')
         return f, 10.0 * np.log10(psd + 1e-20)
 
-    def _local_floor(self, rel: np.ndarray, last_audible: int) -> np.ndarray:
-        """Median of the surrounding ~600 Hz; flat past the codec lowpass so the
+    def _local_floor(self, rel: np.ndarray, last_audible: int, floor_hz: float = 600.) -> np.ndarray:
+        """Median of the configured neighbourhood; flat past the codec lowpass so the
         cliff does not make tones just below it look extra prominent."""
         df = float(self._welch_f[1] - self._welch_f[0])
-        n = max(int(self.FLOOR_HZ / df) | 1, 31)
+        n = max(int(floor_hz / df) | 1, 3)
         x = rel.copy()
         x[last_audible + 1:] = np.median(x[max(0, last_audible - n):last_audible + 1])
         return ndimage.median_filter(x, size=n, mode='nearest')
@@ -824,15 +867,32 @@ class FilterProcessor:
         n = img.shape[0] // g * g
         return img[:n].reshape(n // g, g, -1).max(axis=1).astype(np.float32)
 
-    def _view_of(self, x: np.ndarray) -> np.ndarray:
+    def _view_of(self, x: np.ndarray, s: FilterSettings | None = None) -> np.ndarray:
         """Tone-lines image of a processed signal, relative to the original's floor."""
         db, _, _ = self._view_db(x)
-        white = db - self._floor[self._view['rows']][:, None] + self._psd_ref
-        return self._pool(white - self._view['offset'])
+        floor = self._floor if s is None else self._detection_data(s)[1]
+        view = self.tone_view(s)
+        white = db - floor[view['rows']][:, None] + self._psd_ref
+        return self._pool(white - view['offset'])
 
-    def tone_prominence(self) -> np.ndarray:
+    def _detection_data(self, s: FilterSettings):
+        key = (s.steady_pct, s.floor_hz, s.min_level_db)
+        if key not in self._detection_cache:
+            db = self._welch_db if s.steady_pct == 50. else self._welch(self._mono, s.steady_pct)[1]
+            rel = db - self._psd_ref
+            audible = rel > s.min_level_db
+            last = int(np.nonzero(audible)[0][-1]) if np.any(audible) else len(rel) - 1
+            data = (rel, self._local_floor(rel, last, s.floor_hz), audible)
+            # Bound cached arrays when sweeping controls; results are immutable per job.
+            if len(self._detection_cache) >= 8:
+                self._detection_cache.clear()
+            self._detection_cache[key] = data
+        return self._detection_cache[key]
+
+    def tone_prominence(self, s: FilterSettings | None = None) -> np.ndarray:
         """How far each bin of the original stands above its surroundings (dB)."""
-        return self._welch_db - self._psd_ref - self._floor
+        rel, floor, _ = self._detection_data(s or FilterSettings())
+        return rel - floor
 
     # ── Display data ─────────────────────────────────────────
 
@@ -841,8 +901,13 @@ class FilterProcessor:
             return np.array([]), np.array([])
         return self._welch_f.copy(), self._welch_db - self._psd_ref
 
-    def tone_view(self) -> dict | None:
-        return self._view
+    def tone_view(self, s: FilterSettings | None = None) -> dict | None:
+        if s is None or self._view is None:
+            return self._view
+        floor = self._detection_data(s)[1]
+        white = self._view['db'] - floor[self._view['rows']][:, None] + self._psd_ref
+        offset = np.median(white, axis=0, keepdims=True)
+        return {**self._view, 'offset': offset, 'orig': self._pool(white - offset)}
 
     # ── Weights (0 = untouched, 1 = fully targeted) ──────────
 
@@ -876,7 +941,7 @@ class FilterProcessor:
         return 1.0 - passthrough
 
     def shelf_gain_db(self, freqs: np.ndarray, s: FilterSettings) -> np.ndarray:
-        if not s.shelf_on:
+        if not s.shelf_on or s.edit_mode != 'range':
             return np.zeros(len(freqs))
         w = self.shelf_weight(freqs, s.fade_start, s.cutoff, s.curve)
         g = 1.0 - w * (1.0 - 10.0 ** (min(s.shelf_depth_db, 0.0) / 20.0))
@@ -884,35 +949,41 @@ class FilterProcessor:
 
     # ── Tone detection ───────────────────────────────────────
 
-    def _find_tones(self, rel: np.ndarray, thr: float, min_hz: float) -> tuple:
+    def _find_tones(self, rel: np.ndarray, thr: float, min_hz: float,
+                    s: FilterSettings | None = None) -> tuple:
+        s = s or FilterSettings()
+        _, floor, audible = self._detection_data(s)
         f = self._welch_f
         df = float(f[1] - f[0])
-        prom = rel - self._floor
+        prom = rel - floor
         pk, _ = signal.find_peaks(prom, height=thr, distance=2)
-        pk = pk[(f[pk] >= min_hz) & self._audible[pk] & (f[pk] < 0.49 * self._sr)]
+        pk = pk[(f[pk] >= min_hz) & audible[pk] & (f[pk] <= s.max_hz) & (f[pk] < 0.49 * self._sr)]
         if pk.size == 0:
             return pk, prom, np.array([])
         fwhm = signal.peak_widths(prom, pk, rel_height=0.5)[0] * df
-        keep = fwhm <= self.TONE_MAX_FWHM_HZ
+        keep = fwhm <= s.max_fwhm_hz
         return pk[keep], prom, fwhm[keep]
 
-    def detect_tones(self, thr: float, min_hz: float, rel: np.ndarray | None = None) -> list:
+    def detect_tones(self, thr: float, min_hz: float, rel: np.ndarray | None = None,
+                     s: FilterSettings | None = None) -> list:
         if not self.loaded:
             return []
+        s = s or FilterSettings()
         if rel is None:
-            rel = self._welch_db - self._psd_ref
-        pk, prom, fwhm = self._find_tones(rel, thr, min_hz)
-        if pk.size > self.TONE_MAX_COUNT:
-            order = np.argsort(prom[pk])[::-1][:self.TONE_MAX_COUNT]
+            rel = self._detection_data(s)[0]
+        pk, prom, fwhm = self._find_tones(rel, thr, min_hz, s)
+        if pk.size > s.max_outliers:
+            order = np.argsort(prom[pk])[::-1][:s.max_outliers]
             pk, fwhm = pk[order], fwhm[order]
         df = float(self._welch_f[1] - self._welch_f[0])
-        widths = np.clip(2.0 * fwhm, 4.0 * df, self.TONE_MAX_WIDTH_HZ)
+        widths = np.clip(2.0 * fwhm, min(4.0 * df, s.notch_cap_hz), s.notch_cap_hz)
         tones = [{'freq': round(float(self._welch_f[k]), 1), 'width': round(float(w), 1),
                   'on': True, 'prom': round(float(prom[k]), 1)} for k, w in zip(pk, widths)]
         return sorted(tones, key=lambda t: t['freq'])
 
-    def count_tones(self, rel: np.ndarray, thr: float, min_hz: float) -> int:
-        return int(self._find_tones(rel, thr, min_hz)[0].size)
+    def count_tones(self, rel: np.ndarray, thr: float, min_hz: float,
+                    s: FilterSettings | None = None) -> int:
+        return int(self._find_tones(rel, thr, min_hz, s)[0].size)
 
     @staticmethod
     def _merge_tones(base: list, extra: list) -> list:
@@ -924,23 +995,27 @@ class FilterProcessor:
 
     # ── Full clean (detect → optional second pass → apply) ────
 
-    def clean(self, s: FilterSettings, detect: bool, progress=None) -> tuple[list, np.ndarray]:
+    def clean(self, s: FilterSettings, detect: bool, progress=None, trace_out=None) -> tuple[list, np.ndarray]:
         say = progress or (lambda _msg: None)
         s = s.copy()
         if detect and s.tones_on:
-            say('Finding AI tones …')
-            s.notches = self.detect_tones(s.threshold_db, s.min_hz)
+            say('Finding spectral outliers …')
+            s.notches = self.detect_tones(s.threshold_db, s.min_hz, s=s)
             if s.second_pass and s.notches:
                 say(f'Second pass — {len(s.notches)} tones found, checking for leftovers …')
                 tones_only = s.copy()
                 tones_only.shelf_on = False
+                tones_only.eq_curves = []
                 out = self.apply(tones_only)
-                _, d = self._welch(out.mean(axis=1))
-                extra = self.detect_tones(s.threshold_db, s.min_hz, d - self._psd_ref)
+                _, d = self._welch(out.mean(axis=1), s.steady_pct)
+                extra = self.detect_tones(s.threshold_db, s.min_hz, d - self._psd_ref, s=s)
                 s.notches = self._merge_tones(s.notches, extra)
+                if len(s.notches) > s.max_outliers:
+                    s.notches = sorted(sorted(s.notches, key=lambda n: n.get('prom', 0),
+                                              reverse=True)[:s.max_outliers], key=lambda n: n['freq'])
                 del out
         say('Cleaning …')
-        return s.notches, self.apply(s)
+        return s.notches, self.apply(s, trace_out=trace_out)
 
     # ── STFT helpers ─────────────────────────────────────────
 
@@ -1046,7 +1121,7 @@ class FilterProcessor:
         hop   = self._hop(nperseg)
         freqs = np.fft.rfftfreq(nperseg, 1.0 / self._sr)
         W     = weight_fn(freqs)
-        rows  = np.nonzero(W > self.WEIGHT_EPS)[0]
+        rows  = np.nonzero(np.abs(W) > self.WEIGHT_EPS)[0]
         if rows.size == 0:
             return audio
         w     = W[rows].astype(np.float32)
@@ -1084,17 +1159,93 @@ class FilterProcessor:
             out = [m + side, m - side]
         return np.column_stack(out).astype(np.float32)
 
-    def apply(self, s: FilterSettings) -> np.ndarray | None:
+    def suggest_eq_curves(self, s: FilterSettings, limit=6):
+        """Turn the strongest detected resonances into editable dynamic bands."""
+        notches = self.detect_tones(s.threshold_db, s.min_hz, s=s)
+        candidates = sorted(notches, key=lambda n: n.get('prom', 0), reverse=True)
+        chosen = []
+        for n in candidates:
+            if any(abs(np.log2(n['freq']/c['freq'])) < .35 for c in chosen):
+                continue
+            minimum = float(np.clip(s.auto_min_width, .1, 2.))
+            width = np.clip(6*n['width']/max(n['freq'], 20)/np.log(2), minimum, max(1.5, minimum))
+            chosen.append(normalize_curve(dict(type='bell', freq=n['freq'], width=width,
+                gain=-np.clip(n.get('prom', 8), 6, 18), auto=True, dynamic=True)))
+            if len(chosen) >= limit:
+                break
+        if not chosen:
+            return []
+        nfft = self._fit(int(s.resolution) or 8192, len(self._audio))
+        freqs = np.fft.rfftfreq(nfft, 1/self._sr)
+        profiles = np.array([curve_gain_db(freqs, c) for c in chosen])
+        rows = np.flatnonzero(np.any(np.abs(profiles) > self.WEIGHT_EPS, axis=0))
+        # Estimate thresholds from the actual band levels, without cancelling
+        # stereo channels during analysis.
+        bands = [self._stft_rows(self._audio[:, ch], nfft, rows)[0]
+                 for ch in range(self._n_ch)]
+        for c, profile in zip(chosen, profiles):
+            levels = band_levels(bands, profile[rows])
+            audible = levels[levels > -100]
+            c['threshold'] = float(np.clip(np.percentile(audible, 60)-4, -100, -6)) if audible.size else -60.
+        return sorted(chosen, key=lambda c: c['freq'])
+
+    def _run_eq_stage(self, audio, s, trace_out=None):
+        nfft = self._fit(int(s.resolution) or 8192, len(audio))
+        hop = self._hop(nfft)
+        freqs = np.fft.rfftfreq(nfft, 1/self._sr)
+        curves = [normalize_curve(c) for c in s.eq_curves]
+        profiles = np.array([curve_gain_db(freqs, c) for c in curves], dtype=np.float32)
+        rows = np.flatnonzero(np.any(np.abs(profiles) > self.WEIGHT_EPS, axis=0))
+        if not rows.size:
+            return audio
+        mid_only = self._n_ch == 2 and s.stereo == 'mid'
+        side = (audio[:, 0]-audio[:, 1])*.5 if mid_only else None
+        chans = [(audio[:, 0]+audio[:, 1])*.5] if mid_only else [audio[:, i] for i in range(self._n_ch)]
+        stfts = [self._stft_rows(x, nfft, rows) for x in chans]
+        bands = [b for b, _ in stfts]
+        frames = stfts[0][1]
+        activity = []
+        for c, profile in zip(curves, profiles):
+            maximum = float(np.max(np.abs(profile)))
+            if maximum < 1e-8 or not c['on']:
+                activity.append(np.zeros(frames, dtype=np.float32))
+            else:
+                levels = band_levels(bands, profile[rows])
+                activity.append(activity_envelope(levels, c, maximum, hop/self._sr))
+        activity = np.array(activity, dtype=np.float32)
+        coherence = (self._coherence(bands[0], bands[1]).astype(np.float32)
+                     if len(bands) == 2 and s.stereo == 'coherence' else np.ones(len(rows), dtype=np.float32))
+        effective_profiles = profiles.copy()
+        effective_profiles[:, rows] *= coherence
+        if trace_out is not None:
+            trace_out.update(freqs=freqs, profiles=effective_profiles, activity=activity,
+                             hop=hop, sr=self._sr, curves=curves)
+        # Apply in short chunks, keeping the full-track gain matrix out of RAM.
+        selected = effective_profiles[:, rows]
+        for start in range(0, frames, 128):
+            stop = min(start+128, frames)
+            db = np.einsum('bf,bt->ft', selected, activity[:, start:stop], optimize=False)
+            gain = 1.-10.**(np.clip(db, -120., 36.)/20.)
+            for band in bands:
+                band[:, start:stop] *= gain
+        out = [x-self._istft_rows(b, rows, nfft, frames, len(audio)) for x, b in zip(chans, bands)]
+        if mid_only:
+            out = [out[0]+side, out[0]-side]
+        return np.column_stack(out).astype(np.float32)
+
+    def apply(self, s: FilterSettings, trace_out=None) -> np.ndarray | None:
         if not self.loaded:
             return None
         out = self._audio
         if s.tones_on and any(n.get('on', True) for n in s.notches):
             out = self._run_stage(out, s, lambda f: self.notch_weight(f, s.notches),
                                   s.tone_depth_db, self.nperseg_tones(s))
-        if s.shelf_on:
+        if s.shelf_on and s.edit_mode == 'range':
             out = self._run_stage(out, s,
                                   lambda f: self.shelf_weight(f, s.fade_start, s.cutoff, s.curve),
                                   s.shelf_depth_db, self.nperseg_shelf(s))
+        if s.edit_mode == 'curves' and any(c.get('on', True) for c in s.eq_curves):
+            out = self._run_eq_stage(out, s, trace_out)
         return out.copy() if out is self._audio else out
 
     # ── Result analysis ──────────────────────────────────────
@@ -1109,21 +1260,22 @@ class FilterProcessor:
         proc_mono = processed.mean(axis=1)
         res_mono  = residual.mean(axis=1)
         (f, proc_db), (_, res_db), view_proc, view_res = _pmap(lambda job: job(), [
-            lambda: self._welch(proc_mono), lambda: self._welch(res_mono),
-            lambda: self._view_of(proc_mono), lambda: self._view_of(res_mono)])
-        orig_rel = self._welch_db - self._psd_ref
+            lambda: self._welch(proc_mono, s.steady_pct), lambda: self._welch(res_mono),
+            lambda: self._view_of(proc_mono, s), lambda: self._view_of(res_mono, s)])
+        orig_rel, floor, audible = self._detection_data(s)
         proc_rel = proc_db - self._psd_ref
+        manual_db = (combined_gain_db(f, [c for c in s.eq_curves if not c.get('dynamic', True)]) if s.edit_mode == 'curves'
+                     else self.shelf_gain_db(f, s))
 
         # Tones still standing out after cleaning — measured against the original
         # floor (lowered by the shelf where it applies), so notch dips can't fake a result.
-        tones_before = self.count_tones(orig_rel, s.threshold_db, s.min_hz)
-        tones_after  = self.count_tones(proc_rel - self.shelf_gain_db(f, s), s.threshold_db, s.min_hz)
+        tones_before = self.count_tones(orig_rel, s.threshold_db, s.min_hz, s)
+        tones_after  = self.count_tones(proc_rel - manual_db, s.threshold_db, s.min_hz, s)
 
         # Flatness of what was removed: ~0 = tones (good), ~1 = broadband music.
         flatness = None
         w_t = self.notch_weight(f, s.notches) if s.tones_on else np.zeros(len(f))
-        w_s = self.shelf_weight(f, s.fade_start, s.cutoff, s.curve) if s.shelf_on else np.zeros(len(f))
-        region = ((w_t > 0.05) | (w_s > 0.05)) & self._audible
+        region = ((w_t > 0.05) | (np.abs(manual_db) > .5)) & audible
         if np.count_nonzero(region) >= 4 and e_res > 0:
             p = 10.0 ** (res_db[region] / 10.0)
             flatness = float(np.exp(np.mean(np.log(p + 1e-30))) / (np.mean(p) + 1e-30))
@@ -1142,7 +1294,7 @@ class FilterProcessor:
             'tones_after':  tones_after,
             'psd_f':        f,
             'psd_proc':     proc_rel,
-            'prom_proc':    proc_rel - self.shelf_gain_db(f, s) - self._floor,
+            'prom_proc':    proc_rel - manual_db - floor,
             'view_proc':    view_proc,
             'view_res':     view_res,
             'boost':        boost,
@@ -1162,7 +1314,7 @@ def _style_axes(ax):
     ax.set_facecolor(C['ax_bg'])
     for sp in ax.spines.values():
         sp.set_edgecolor(C['grid'])
-    ax.tick_params(which='both', colors=C['text'], labelsize=8)
+    ax.tick_params(which='both', colors=C['text'], labelsize=10)
     ax.xaxis.label.set_color(C['text'])
     ax.yaxis.label.set_color(C['text'])
 
@@ -1173,7 +1325,7 @@ class _HzLogFormatter(LogFormatter):
         return f'{x / 1000:g}k' if x >= 1000 else f'{x:g}'
 
 
-class SpectrumCanvas(FigureCanvasQTAgg):
+class RangeSpectrumCanvas(FigureCanvasQTAgg):
     shelf_changed  = pyqtSignal(float, float)   # (fade_start_hz, cutoff_hz)
     notches_edited = pyqtSignal(list)
     view_changed   = pyqtSignal(float, float)   # (lo_hz, hi_hz) after any zoom/pan
@@ -1454,9 +1606,16 @@ class SpectrumCanvas(FigureCanvasQTAgg):
 
 
 # ──────────────────────────────────────────────────────────────
+class SpectrumCanvas(LiveSpectrumMixin, RangeSpectrumCanvas):
+    curves_edited = pyqtSignal(list)
+    curves_preview = pyqtSignal(list)
+    curve_selected = pyqtSignal(int)
+    add_curve_requested = pyqtSignal(float)
+
+
 #  TONE CLOSE-UP  (linear frequency, level above the local floor)
 #
-#  Blue spikes = AI tones in the original. Green = after cleaning.
+#  Blue spikes = spectral outliers in the original. Green = after cleaning.
 #  Anything green still above the yellow line is a tone that is left.
 #  RMB = add a notch   scroll = zoom   MMB drag = pan   double-click = reset
 # ──────────────────────────────────────────────────────────────
@@ -1473,19 +1632,56 @@ class ToneCloseupCanvas(FigureCanvasQTAgg):
 
         self.ax = self.fig.add_subplot(111)
         _style_axes(self.ax)
-        self.ax.set_xlabel('Frequency (kHz)', fontsize=9)
-        self.ax.set_ylabel('dB above surroundings', fontsize=9)
+        self.ax.set_xlabel('Frequency (kHz)', fontsize=11)
+        self.ax.set_ylabel('Outlier strength (dB above local floor)', fontsize=11)
         self.ax.grid(True, color=C['grid'], alpha=0.5, lw=0.5)
-        self.ax.set_title('Tone close-up · blue spikes = AI tones · green = after cleaning · '
-                          'green above the yellow line = still there', color=C['text'], fontsize=9.5, pad=6)
+        self.ax.set_title('')
         self._full = (4.0, 16.0)
         self._orig = self._proc = self._thr = None
         self._ticks = []
         self._pan = None
+        self._live, = self.ax.plot([], [], color='#eeeeee', lw=.8, alpha=.7, zorder=7, animated=True)
+        self.ax.set_ylim(-12., 30.)
+        self._bg = None
+        self._last_frame = None
+        self.mpl_connect('draw_event', self._on_draw)
         self.mpl_connect('button_press_event',   self._on_press)
         self.mpl_connect('motion_notify_event',  self._on_motion)
         self.mpl_connect('button_release_event', self._on_release)
         self.mpl_connect('scroll_event',         self._on_scroll)
+
+    def _on_draw(self, _event):
+        self._bg = self.copy_from_bbox(self.fig.bbox)
+        self.ax.draw_artist(self._live)
+
+    def update_frame(self, audio, sr, frame, floor_hz, residual=None, boost=1., force=False):
+        # At most 20 spectral snapshots/sec; retain a stationary frame while paused.
+        key = (id(audio), id(residual), int(frame // max(1, sr//20)), floor_hz, boost)
+        if key == self._last_frame and not force:
+            return
+        self._last_frame = key
+        size = 8192
+        lo, hi = max(0, frame-size//2), min(len(audio), frame+size//2)
+        segment = audio[lo:hi]
+        if residual is not None:
+            segment = (segment-residual[lo:hi])*boost
+        if segment.ndim == 1:
+            segment = segment[:, None]
+        if len(segment) < 2:
+            return
+        power = np.mean(np.abs(np.fft.rfft(segment*np.hanning(len(segment))[:, None], n=size, axis=0))**2, axis=1)
+        db = ndimage.gaussian_filter1d(10*np.log10(np.maximum(power, 1e-20)), .8)
+        bins = max(3, int(floor_hz/(sr/size)) | 1)
+        floor = ndimage.median_filter(db, size=bins, mode='nearest')
+        prominence = db-floor
+        prominence[db < np.max(db)-70] = np.nan
+        self._live.set_data(np.fft.rfftfreq(size, 1/sr)/1000, prominence)
+        if self._bg is not None:
+            self.restore_region(self._bg)
+            self.ax.draw_artist(self._live)
+            self.blit(self.fig.bbox)
+        else:
+            self.draw_idle()
 
     def set_original(self, freqs: np.ndarray, prom: np.ndarray, lo_hz: float, hi_hz: float):
         for art in (self._orig, self._proc):
@@ -1498,7 +1694,7 @@ class ToneCloseupCanvas(FigureCanvasQTAgg):
         self.ax.set_xlim(*self._full)
         m = (freqs >= lo_hz) & (freqs <= hi_hz)
         top = float(np.percentile(prom[m], 99.9)) if np.any(m) else 20.0
-        self.ax.set_ylim(-12.0, max(top + 4.0, 15.0))
+        self.ax.set_ylim(-12.0, max(top + 4.0, 30.0))
         self.draw_idle()
 
     def set_processed(self, prom_proc: np.ndarray | None):
@@ -1586,12 +1782,6 @@ class ToneLinesCanvas(FigureCanvasQTAgg):
     DRAG_PX = 5
     VMIN, VMAX = 3.0, 18.0
 
-    _VIEW_TITLES = {
-        'orig': ('Original — every bright horizontal line is a steady AI tone', C['orig']),
-        'proc': ('Cleaned — the lines should be gone', C['proc']),
-        'res':  ('Removed — what the cleaner takes out', C['res']),
-    }
-
     def __init__(self, parent=None):
         self.fig = Figure(facecolor=C['bg'], tight_layout=True)
         super().__init__(self.fig)
@@ -1601,8 +1791,8 @@ class ToneLinesCanvas(FigureCanvasQTAgg):
 
         self.ax = self.fig.add_subplot(111)
         _style_axes(self.ax)
-        self.ax.set_xlabel('Time', fontsize=9)
-        self.ax.set_ylabel('kHz', fontsize=9)
+        self.ax.set_xlabel('Time', fontsize=11)
+        self.ax.set_ylabel('Frequency (kHz)', fontsize=11)
         self.ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: fmt_time(v)))
 
         self._images: dict = {}
@@ -1617,8 +1807,13 @@ class ToneLinesCanvas(FigureCanvasQTAgg):
         self._press = None
         self.pick_loop = False   # next drag picks the loop section
 
-        self._playhead = self.ax.axvline(0.0, color='#ffffff', lw=1.0, alpha=0.8, animated=True)
+        self._playhead = self.ax.axvline(0.0, color='#ffffff', lw=1.6, alpha=1., animated=True)
+        self._playtime = self.ax.text(.01, .98, '0:00', transform=self.ax.transAxes,
+                                     color='#ffffff', fontsize=11, va='top', animated=True,
+                                     bbox=dict(facecolor='#222222', edgecolor='#666666', alpha=.95, pad=4))
         self._bg = None
+        self._last_playhead = None
+        self._colorbar = None
         self._set_title()
 
         self.mpl_connect('draw_event',           self._on_draw)
@@ -1635,8 +1830,16 @@ class ToneLinesCanvas(FigureCanvasQTAgg):
         if self._img is not None:
             self._img.remove()
         self._img = self.ax.imshow(
-            view['orig'], origin='lower', aspect='auto', extent=self._extent, cmap='magma',
+            view['orig'], origin='lower', aspect='auto', extent=self._extent,
+            cmap=LinearSegmentedColormap.from_list('outliers', ['#161616', '#4d5255', '#aaa07d', '#f1cb78', '#fff3cf']),
             vmin=self.VMIN, vmax=self.VMAX, interpolation='antialiased', zorder=0)
+        if self._colorbar is None:
+            self._colorbar = self.fig.colorbar(self._img, ax=self.ax, pad=.025, fraction=.035)
+            self._colorbar.set_label('Outlier strength (dB)', color=C['text'], fontsize=10)
+            self._colorbar.ax.tick_params(colors=C['text'], labelsize=10)
+            self._colorbar.outline.set_edgecolor(C['grid'])
+        else:
+            self._colorbar.update_normal(self._img)
         lo = max(self._extent[2], focus_lo_hz / 1000.0)
         hi = min(self._extent[3], focus_hi_hz / 1000.0)
         self._default_ylim = (lo, hi) if hi > lo else (self._extent[2], self._extent[3])
@@ -1711,22 +1914,28 @@ class ToneLinesCanvas(FigureCanvasQTAgg):
         self.draw_idle()
 
     def set_playhead(self, t: float):
+        if self._last_playhead == t and self._bg is not None:
+            return
+        self._last_playhead = t
         self._playhead.set_xdata([t, t])
+        self._playtime.set_text(fmt_time(t, True))
         if self._bg is None:
+            self.draw_idle()
             return
         self.restore_region(self._bg)
         self.ax.draw_artist(self._playhead)
+        self.ax.draw_artist(self._playtime)
         self.blit(self.fig.bbox)
 
     # ── Internal ──────────────────────────────────────────────
 
     def _set_title(self):
-        name, col = self._VIEW_TITLES.get(self._view, self._VIEW_TITLES['orig'])
-        self.ax.set_title(f'Tone lines  ·  {name}', color=col, fontsize=10.5, pad=6)
+        self.ax.set_title('')
 
     def _on_draw(self, _event):
         self._bg = self.copy_from_bbox(self.fig.bbox)
         self.ax.draw_artist(self._playhead)
+        self.ax.draw_artist(self._playtime)
 
     def _on_press(self, event):
         if event.inaxes != self.ax or event.xdata is None or self._img is None:
@@ -1818,11 +2027,13 @@ class CleanWorker(QThread):
     error    = pyqtSignal(str, int)
 
     def __init__(self, processor: FilterProcessor, settings: FilterSettings,
-                 detect: bool, generation: int):
+                 detect: bool, generation: int, suggest=False, auto_if_empty=True):
         super().__init__()
         self.processor  = processor
         self.settings   = settings
         self.detect     = detect
+        self.suggest    = suggest
+        self.auto_if_empty = auto_if_empty
         self.generation = generation
 
     def run(self):
@@ -1830,12 +2041,22 @@ class CleanWorker(QThread):
             say = lambda msg: self.progress.emit(msg, self.generation)
             GPU.last_error = ''
             t0 = time.perf_counter()
-            notches, audio = self.processor.clean(self.settings, self.detect, say)
+            settings = self.settings.copy()
+            suggested = settings.edit_mode == 'curves' and (self.suggest or
+                (self.auto_if_empty and settings.auto_eq and not settings.eq_curves))
+            if suggested:
+                say('Creating dynamic curves from the strongest spectral outliers ...')
+                manual = [c for c in settings.eq_curves if not c.get('auto', False)]
+                settings.eq_curves = manual + self.processor.suggest_eq_curves(settings)
+                # Suggested dynamic bands replace the legacy fixed notch stage.
+                settings.tones_on = False
+            trace = {}
+            notches, audio = self.processor.clean(settings, self.detect and not suggested, say, trace_out=trace)
             say('Measuring the result …')
-            s = self.settings.copy()
+            s = settings.copy()
             s.notches = notches
             result = self.processor.analyse(audio, s)
-            result.update(seconds=time.perf_counter() - t0,
+            result.update(eq_trace=trace or None, suggested=suggested, seconds=time.perf_counter() - t0,
                           device='CPU' if GPU.torch() is None or GPU.last_error else 'GPU',
                           audio=audio, notches=notches, detected=self.detect and s.tones_on,
                           generation=self.generation, settings=s)
@@ -1847,7 +2068,7 @@ class CleanWorker(QThread):
 class BatchWorker(QThread):
     """Cleans a list of files with one set of settings and saves each result.
 
-    detect_per_file: each track finds its own AI tones with those settings;
+    detect_per_file: each track finds its own spectral outliers with those settings;
     otherwise every track uses settings.notches. manual_notches (path → list)
     override both for tracks whose tone list was edited by hand."""
     progress     = pyqtSignal(str)
@@ -1889,6 +2110,10 @@ class BatchWorker(QThread):
                 if path in self.manual_notches:
                     s.notches = [dict(n) for n in self.manual_notches[path]]
                     detect = False
+                if s.edit_mode == 'curves' and s.auto_eq and not s.eq_curves:
+                    s.eq_curves = proc.suggest_eq_curves(s)
+                    s.tones_on = False
+                    detect = False
                 notches, result = proc.clean(s, detect, say)
                 say('saving …')
                 out, fmt, sub = output_path(path, self.out_dir, self.suffix, self.fmt_key)
@@ -1897,7 +2122,8 @@ class BatchWorker(QThread):
                     diff_out, fmt, sub = output_path(path, self.out_dir, self.diff_suffix, self.fmt_key)
                     write_audio(diff_out, proc.audio - result, sr, fmt, sub)
                 n_on = sum(1 for n in notches if n.get('on', True)) if s.tones_on else 0
-                lines.append(f'{name} → {out.name}: {n_on} tones removed')
+                detail = f'{len(s.eq_curves)} EQ bands' if s.edit_mode == 'curves' and s.eq_curves else f'{n_on} tones removed'
+                lines.append(f'{name} -> {out.name}: {detail}')
                 done += 1
             except Exception as e:
                 errors.append(f'{name}: {e}')
@@ -1990,8 +2216,8 @@ class BatchDialog(QDialog):
         bs.setColumnStretch(1, 1)
         lay.addWidget(box_s)
 
-        # ── AI tones ──
-        box_n = Card('AI tones', collapsible=False)
+        # ── spectral outliers ──
+        box_n = Card('spectral outliers', collapsible=False)
         bn = QVBoxLayout(box_n.body)
         self.rb_detect = QRadioButton('Find the tones in each track separately (recommended)')
         self.rb_list = QRadioButton(f'Use the current tone list for every track ({n_current_tones} tones)')
@@ -2136,67 +2362,167 @@ class SettingsDialog(QDialog):
                  history_lines: dict, history_clear: str):
         super().__init__(parent)
         self.setWindowTitle('Settings')
-        self.setMinimumWidth(440)
+        self.setModal(True)
+        self.resize(780, 660)
+        self.setMinimumSize(680, 480)
+        self._borrowed = []
+        self.tabs = QTabWidget()
+        self.pages = {}
+        root = QVBoxLayout(self)
+        root.addWidget(self.tabs)
 
-        form = QFormLayout()
-        form.setVerticalSpacing(10)
-        self.edit_suffix = QLineEdit(suffix)
-        self.edit_suffix.setPlaceholderText('_cleaned')
-        self.edit_suffix.setToolTip(TIPS['set_suffix'])
-        form.addRow('Name suffix:', self.edit_suffix)
+        def page(title):
+            content = QWidget()
+            layout = QVBoxLayout(content)
+            layout.setContentsMargins(16, 16, 16, 16)
+            layout.setSpacing(14)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setWidget(content)
+            self.tabs.addTab(scroll, title)
+            self.pages[title] = layout
+            return layout
 
-        self.combo_format = QComboBox()
-        for key, (label, *_rest) in EXPORT_FORMATS.items():
-            self.combo_format.addItem(label, key)
-        self.combo_format.setCurrentIndex(max(self.combo_format.findData(fmt_key), 0))
-        self.combo_format.setToolTip(TIPS['set_format'])
-        form.addRow('Output format:', self.combo_format)
-
-        self.chk_detect = QCheckBox('Auto-detect AI tones for each track that is opened')
-        self.chk_detect.setToolTip(TIPS['set_detect'])
-        self.chk_detect.setChecked(detect_on_load)
-        form.addRow(self.chk_detect)
-
+        general = page('General')
         gpu = GPU.device_name()
         self.chk_gpu = QCheckBox(f'Process on the GPU ({gpu})' if gpu else
                                  'Process on the GPU (needs PyTorch with CUDA)')
         self.chk_gpu.setChecked(use_gpu and bool(gpu))
         self.chk_gpu.setEnabled(bool(gpu))
-        self.chk_gpu.setToolTip(TIPS['set_gpu'])
-        form.addRow(self.chk_gpu)
+        general.addWidget(self.chk_gpu)
+        self.chk_detect = QCheckBox('Re-detect fixed cuts when reopening a track')
+        self.chk_detect.setChecked(detect_on_load)
+        general.addWidget(self.chk_detect)
+        volume_form = QFormLayout()
+        self.slider_volume = QSlider(Qt.Orientation.Horizontal)
+        self.slider_volume.setRange(0, 100)
+        self.slider_volume.setValue(parent.slider_vol.value())
+        volume_form.addRow('Playback volume', self.slider_volume)
+        general.addLayout(volume_form)
+        general.addStretch()
 
-        lines = QVBoxLayout()
-        lines.setSpacing(4)
+        processing = page('Processing')
+        processing.addWidget(_hint('Processing settings apply to the current track.'))
+        shaping = QFormLayout()
+        self.combo_shaping = self._combo([('EQ curves', 'curves'), ('Soften highs', 'range')], parent.fs.edit_mode)
+        shaping.addRow('Shaping mode', self.combo_shaping)
+        processing.addLayout(shaping)
+        self._borrow_cards(parent, processing, ('strength', 'shelf', 'advanced'))
+        parent.box_shelf.setVisible(parent.fs.edit_mode == 'range')
+        processing.addStretch()
+        detection = page('Outliers')
+        suggestions = QFormLayout()
+        self.combo_auto_width = self._combo([(f'{v:g} octave', v) for v in (.35, .65, 1., 1.5)], parent.fs.auto_min_width)
+        suggestions.addRow('Minimum automatic band width', self.combo_auto_width)
+        detection.addLayout(suggestions)
+        self._borrow_cards(parent, detection, ('tones',))
+        detection.addStretch()
+
+        analyzer = page('Analyzer')
+        analyzer_form = QFormLayout()
+        self.combo_smoothing = self._combo([
+            ('Fine - 1/48 octave', 1/48), ('Normal - 1/24 octave', 1/24),
+            ('Smooth - 1/12 octave', 1/12)], parent.spectrum.smoothing_octaves)
+        self.combo_gain_range = self._combo([(f'\u00b1{v} dB', v) for v in (12,24,48,72)], parent.spectrum.gain_range)
+        self.combo_peak_decay = self._combo([('Hold indefinitely', 0.), ('0.25 dB/s', .25),
+                                             ('0.5 dB/s', .5), ('1 dB/s', 1.)], parent.spectrum.peak_decay_db)
+        analyzer_form.addRow('Spectrum smoothing', self.combo_smoothing)
+        analyzer_form.addRow('EQ gain range', self.combo_gain_range)
+        analyzer_form.addRow('Peak fade', self.combo_peak_decay)
+        analyzer.addLayout(analyzer_form)
+        self.chk_auto_cuts = QCheckBox('Show fixed-cut response in the spectrum (display only)')
+        self.chk_auto_cuts.setChecked(parent.spectrum.show_auto_cuts)
+        analyzer.addWidget(self.chk_auto_cuts)
+        reset = QPushButton('Reset peak hold')
+        reset.clicked.connect(parent.spectrum.reset_peak)
+        analyzer.addWidget(reset, alignment=Qt.AlignmentFlag.AlignLeft)
+        analyzer.addStretch()
+
+        appearance = page('Appearance')
+        appearance_form = QFormLayout()
+        self.combo_profile = self._combo([(v[0], k) for k,v in COLOR_PROFILES.items()], parent.color_profile)
+        self.combo_accent = self._combo([(v[0], k) for k,v in SPECTRUM_ACCENTS.items()], parent.spectrum_accent)
+        appearance_form.addRow('Color profile', self.combo_profile)
+        appearance_form.addRow('Spectrum accent', self.combo_accent)
+        appearance.addLayout(appearance_form)
+        appearance.addWidget(_hint('The accent colors the frequency display. A/B uses blue for original and green for cleaned audio.'))
+        appearance.addStretch()
+
+        export = page('Export')
+        export_form = QFormLayout()
+        self.edit_suffix = QLineEdit(suffix)
+        self.edit_suffix.setPlaceholderText('_cleaned')
+        self.combo_format = self._combo([(v[0],k) for k,v in EXPORT_FORMATS.items()], fmt_key)
+        export_form.addRow('Name suffix', self.edit_suffix)
+        export_form.addRow('Output format', self.combo_format)
+        export.addLayout(export_form)
+        export.addStretch()
+
+        history = page('History')
         self.chk_lines = {}
         for key, label in self.HISTORY_LINES:
             chk = QCheckBox(label)
             chk.setChecked(history_lines.get(key, True))
-            chk.setToolTip(TIPS['set_hist_lines'])
             self.chk_lines[key] = chk
-            lines.addWidget(chk)
-        form.addRow('History lines:', lines)
+            history.addWidget(chk)
+        history_form = QFormLayout()
+        self.combo_hist_clear = self._combo([(title, key) for key,title in self.HISTORY_CLEAR], history_clear)
+        history_form.addRow('Clear history', self.combo_hist_clear)
+        history.addLayout(history_form)
+        history.addStretch()
 
-        self.combo_hist_clear = QComboBox()
-        for key, label in self.HISTORY_CLEAR:
-            self.combo_hist_clear.addItem(label, key)
-        self.combo_hist_clear.setCurrentIndex(max(self.combo_hist_clear.findData(history_clear), 0))
-        self.combo_hist_clear.setToolTip(TIPS['set_hist_clear'])
-        form.addRow('Clear history:', self.combo_hist_clear)
+        footer = QHBoxLayout()
+        footer.addWidget(_hint('Changes are saved automatically.'), stretch=1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.accept)
+        footer.addWidget(buttons)
+        root.addLayout(footer)
+        self.combo_smoothing.currentIndexChanged.connect(lambda _: parent._set_analyzer_smoothing(self.combo_smoothing.currentData()))
+        self.slider_volume.valueChanged.connect(parent.slider_vol.setValue)
+        self.combo_auto_width.currentIndexChanged.connect(lambda _: parent._set_auto_width(self.combo_auto_width.currentData()))
+        self.combo_shaping.currentIndexChanged.connect(lambda _: parent.combo_edit_mode.setCurrentIndex(parent.combo_edit_mode.findData(self.combo_shaping.currentData())))
+        self.combo_gain_range.currentIndexChanged.connect(lambda _: parent._set_analyzer_range(self.combo_gain_range.currentData()))
+        self.combo_peak_decay.currentIndexChanged.connect(lambda _: parent._set_peak_decay(self.combo_peak_decay.currentData()))
+        self.chk_auto_cuts.toggled.connect(parent.btn_auto_cuts.setChecked)
+        self.combo_profile.currentIndexChanged.connect(lambda _: parent._set_color_profile(self.combo_profile.currentData()))
+        self.combo_accent.currentIndexChanged.connect(lambda _: parent._set_spectrum_accent(self.combo_accent.currentData()))
+        for widget in (self.chk_gpu, self.chk_detect, *self.chk_lines.values()):
+            widget.toggled.connect(lambda _: parent._apply_app_settings(self))
+        for combo in (self.combo_format, self.combo_hist_clear):
+            combo.currentIndexChanged.connect(lambda _: parent._apply_app_settings(self))
+        self.edit_suffix.editingFinished.connect(lambda: parent._apply_app_settings(self))
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+    @staticmethod
+    def _combo(options, current):
+        combo = QComboBox()
+        for title, value in options:
+            combo.addItem(title, value)
+        combo.setCurrentIndex(max(0, combo.findData(current)))
+        return combo
 
-        lay = QVBoxLayout(self)
-        for i in range(form.rowCount()):   # row labels share their field's tooltip
-            lab = form.itemAt(i, QFormLayout.ItemRole.LabelRole)
-            fld = form.itemAt(i, QFormLayout.ItemRole.FieldRole)
-            if lab and lab.widget() and fld:
-                w = fld.widget() or fld.layout().itemAt(0).widget()
-                lab.widget().setToolTip(w.toolTip())
-        lay.addLayout(form)
-        lay.addWidget(buttons)
+    def _borrow_cards(self, parent, layout, names):
+        for name in names:
+            card = parent.inspector_cards[name]
+            old_parent = card.parentWidget()
+            old_layout = old_parent.layout()
+            self._borrowed.append((card, old_parent, old_layout, old_layout.indexOf(card), card.isHidden(), card.collapsed()))
+            old_layout.removeWidget(card)
+            layout.addWidget(card)
+            card.show()
+            card.set_collapsed(False)
+
+    def done(self, result):
+        for card, parent, layout, index, hidden, collapsed in reversed(self._borrowed):
+            card.setParent(parent)
+            layout.insertWidget(index, card)
+            card.set_collapsed(collapsed)
+            card.setVisible(not hidden)
+        self._borrowed.clear()
+        self.parent().box_shelf.setVisible(self.parent().fs.edit_mode == 'range')
+        self.parent()._apply_app_settings(self)
+        self.parent()._settings.sync()
+        super().done(result)
 
     def suffix(self) -> str:
         return self.edit_suffix.text().strip()
@@ -2239,15 +2565,17 @@ def _use(text: str) -> str:
     return f'<span style="color:#a6e3a1; font-weight:600;">How to use:</span> {text}'
 
 
-AI_TONE_DEF = (
-    'An <b>AI tone</b> is a peak in the track\'s average spectrum that passes all four tests:'
-    '<br>• <b>Steady</b> — there for most of the track. The spectrum is the median over time, '
-    'so notes that come and go do not count.'
-    '<br>• <b>Narrow</b> — under 40 Hz wide at half height. Instruments and voices are wider.'
-    '<br>• <b>Stands out</b> — at least the <i>Sensitivity</i> amount (dB) above the median '
-    'level of the surrounding 600 Hz.'
-    '<br>• <b>High</b> — above <i>Search above</i> and below where the track\'s content ends.'
-    '<br>They sound like faint, constant whistles or a metallic shimmer over the whole song.')
+OUTLIER_DEF = (
+    'A <b>spectral outlier</b> is a narrow peak above the local spectral floor. '
+    'These are possible tonal artifacts, not proof of AI-generated audio.'
+    '<br>• <b>Persistence</b> — the <i>Time percentile</i> summarizes power over time '
+    '(50% is the median; lower favours steadier tones).'
+    '<br>• <b>Narrowness</b> — <i>Max peak width</i> limits width at half prominence.'
+    '<br>• <b>Prominence</b> — <i>Sensitivity</i> is the minimum dB above the median '
+    'within <i>Local median span</i>.'
+    '<br>• <b>Search limits</b> — frequency bounds and <i>Minimum level</i> exclude '
+    'unwanted regions and near-silent bins.'
+    '<br>All of these rules are adjustable in <b>Spectral outliers — automatic</b>.')
 
 _CLR = {'blue': '#89b4fa', 'green': '#a6e3a1', 'red': '#f38ba8', 'orange': '#fab387',
         'yellow': '#f9e2af', 'purple': '#cba6f7'}
@@ -2273,7 +2601,7 @@ TIPS = {
         'Spectrum view',
         'Which frequency range the upper graph shows. The lit button is the range on screen; '
         'after you zoom or pan by hand neither is lit.',
-        _use('stay on <b>AI tone band</b> while tuning tones; switch to <b>Full range</b> to check '
+        _use('stay on <b>spectral outlier band</b> while tuning tones; switch to <b>Full range</b> to check '
              'that nothing in the bass or mids changed.')),
     'zoom_full': _tip(
         'Full range',
@@ -2282,8 +2610,8 @@ TIPS = {
         _use('check that the green (cleaned) line lies on top of the blue one everywhere except '
              'where you meant to cut. Double-clicking the graph does the same.')),
     'zoom_band': _tip(
-        'AI tone band (default)',
-        'Zooms to where AI tones live: from just below <i>Search above</i> up to where the track\'s '
+        'spectral outlier band (default)',
+        'Zooms to where spectral outliers live: from just below <i>Search above</i> up to where the track\'s '
         'content ends. Every track opens in this view.',
         _use('this is the working view — the tone spikes, the red notch ticks and the orange / red '
              'top-band lines are all easy to see and grab here.')),
@@ -2293,14 +2621,14 @@ TIPS = {
         items=((_c('blue', 'Blue'), 'original track (A)'),
                (_c('green', 'Green'), 'after cleaning (B)'),
                (_c('red', 'Red fill'), 'what the cleaner removed'),
-               (_c('red', 'Red ticks'), 'notches in the tone list — one per AI tone'),
+               (_c('red', 'Red ticks'), 'notches in the tone list — one per spectral outlier'),
                (_c('orange', 'Orange line'), 'top-band cut starts fading in'),
                (_c('red', 'Red line'), 'top-band cut at full strength from here up'),
                (_c('yellow', 'Yellow dashed'), 'Sensitivity threshold (Tone close-up)'))),
     'spectrum': _tip(
         'Spectrum',
         'The average level of every frequency over the whole track: left = low (bass), right = high '
-        '(treble), up = louder. AI tones are the thin spikes above about 5 kHz. After cleaning, the '
+        '(treble), up = louder. spectral outliers are the thin spikes above about 5 kHz. After cleaning, the '
         + _c('green', 'green') + ' line should have those spikes flattened while following the '
         + _c('blue', 'blue') + ' line everywhere else. Every change made here re-cleans straight away.',
         '<b>What the lines do</b> (step 2, top band):'
@@ -2310,7 +2638,7 @@ TIPS = {
         '<br>• Above the red line: turned down by the full <i>Reduction</i> amount.'
         '<br>• Orange line further left = more of the treble is softened; further right = only the '
         'very top. Moving either line switches step 2 on.',
-        '<b>What the red ticks do</b> (step 1, AI tones):'
+        '<b>What the red ticks do</b> (step 1, spectral outliers):'
         '<br>• Each tick is a notch that cuts one tone by the step 1 <i>Reduction</i>. Adding one '
         'cuts that frequency (20 Hz wide); removing one leaves that tone in.',
         _use('put the orange line where the sound turns harsh or hissy and the red line a few kHz '
@@ -2330,15 +2658,15 @@ TIPS = {
     'lower_view': _tip(
         'Lower view',
         'Chooses the graph under the spectrum. The lit button is the one on screen.',
-        items=(('Tone close-up', 'which tones were found and which are still there — use while tuning'),
-               ('Tone lines over time', 'where in the song the tones are — use to check by eye and to '
+        items=(('Outlier detail', 'which tones were found and which are still there — use while tuning'),
+               ('Outliers over time', 'where in the song the tones are — use to check by eye and to '
                                         'pick a loop or noise-profile region'))),
     'closeup': _tip(
-        'Tone close-up',
+        'Outlier detail',
         'How far each frequency stands above its own surroundings, in dB. Normal music sits around '
-        '0; every ' + _c('blue', 'blue') + ' spike is a steady AI tone. ' + _c('green', 'Green') +
+        '0; every ' + _c('blue', 'blue') + ' spike is a steady spectral outlier. ' + _c('green', 'Green') +
         ' is the same after cleaning. The ' + _c('yellow', 'yellow dashed line') + ' is the '
-        '<i>Sensitivity</i> threshold: a spike above it counts as an AI tone. ' + _c('red', 'Red ticks') +
+        '<i>Sensitivity</i> threshold: a spike above it counts as an spectral outlier. ' + _c('red', 'Red ticks') +
         ' along the bottom are the notches.',
         _use('after cleaning, look for green spikes still above the yellow line — those tones are '
              'still audible. Raise <i>Reduction</i>, raise <i>Sensitivity</i>, or right-click the '
@@ -2348,14 +2676,13 @@ TIPS = {
                ('Middle drag', 'pan'),
                ('Double-click', 'reset the zoom'))),
     'tonelines': _tip(
-        'Tone lines over time',
-        'A spectrogram of the AI tone band: time runs left → right, frequency bottom → top, brighter '
-        '= stands out more above its surroundings. Steady AI tones show as bright horizontal lines '
+        'Outliers over time',
+        'A spectrogram of the spectral outlier band: time runs left → right, frequency bottom → top, brighter '
+        '= stands out more above its surroundings. Steady spectral outliers show as bright horizontal lines '
         'running through the whole song; music shows as short blobs and streaks.',
         'It shows the original, the cleaned result or the removed part — whatever you are listening '
         'to (A / B / Hear Removed). The white line is the playhead.',
-        _use('in B the horizontal lines should be gone while the music blobs stay. In Hear Removed '
-             'you should see mostly lines, not music.'),
+        _use('compare A/B at the same playback position; the Removed view shows the selected version\'s residual.'),
         items=(('Click', 'jump playback there'),
                ('Drag', 'pick the noise-profile region (Adaptive method)'),
                ('Shift + drag', 'pick the loop section'),
@@ -2368,7 +2695,7 @@ TIPS = {
         'Tracks',
         'Audio files from the input folder plus any you add or drop on the window. MP3, WAV, FLAC, '
         'OGG, AIFF, M4A, MP4, AAC and Opus are supported.',
-        _use('click a track to load it. It is analysed, its AI tones are found and a first clean '
+        _use('click a track to load it. It is analysed, its spectral outliers are found and a first clean '
              'is made automatically. Hover a track for its full path.')),
     'loaded_track': _tip(
         'Loaded track',
@@ -2418,10 +2745,10 @@ TIPS = {
              'it on the next pass.'),
         items=(('L', 'on / off'),)),
     'loop_sec': _tip(
-        'Loop Section',
+        'Section',
         'Sets a part of the track to repeat.',
-        _use('click it, then drag across the Tone lines view over the part you want. Click again to '
-             'clear the section. Shift + drag in the Tone lines view works any time.')),
+        _use('click it, then drag across the spectrogram over the part you want. Click again to '
+             'clear the section. Shift + drag in the spectrogram works any time.')),
     'keys': _tip(
         'Keyboard',
         'Shortcuts that work anywhere in the window.',
@@ -2462,12 +2789,12 @@ TIPS = {
         'removed. Hover each line for details.',
         _use('aim for most tones gone, a small energy figure and “mostly tones”. Your ears decide — '
              'the numbers only warn you.'),
-        items=(('AI tones', 'tones found in the original → tones still there after cleaning'),
+        items=(('spectral outliers', 'tones found in the original → tones still there after cleaning'),
                ('Energy removed', 'how much of the track\'s total energy was taken out'),
                ('Removed sound is', 'whether the removed part is tones (good) or music (too much)'))),
     'tones_count': _tip(
-        'AI tones found → left',
-        AI_TONE_DEF,
+        'spectral outliers found → left',
+        OUTLIER_DEF,
         '<b>Found</b> = peaks in the original that pass the test. <b>Left</b> = peaks in the cleaned '
         'track that still pass it, measured against the original\'s surroundings so a notch\'s dip '
         'cannot hide a tone.',
@@ -2478,7 +2805,7 @@ TIPS = {
     'energy': _tip(
         'Energy removed',
         'The removed part\'s energy as a share of the original track\'s total energy.',
-        'AI tones carry very little energy, so removing only them gives tiny numbers. '
+        'spectral outliers carry very little energy, so removing only them gives tiny numbers. '
         + _c('green', 'Under 1 %') + ' is typical; ' + _c('yellow', '1–5 %') + ' usually means a '
         'strong top-band cut; ' + _c('red', 'over 5 %') + ' means audible music is being taken.',
         _use('if it is yellow or red, listen with Hear Removed and lower the step 2 Reduction.')),
@@ -2523,11 +2850,11 @@ TIPS = {
         'automatically is set in Settings.'),
     'height_grip': _tip('Resize', 'Drag up or down to change the height of the list.'),
 
-    # ── Step 1 · AI tones ───────────────────────────────────
+    # ── Step 1 · spectral outliers ───────────────────────────────────
     'tones': _tip(
-        '1 · Remove AI tones',
+        '1 · Remove spectral outliers',
         'AI music generators leave steady, very narrow tones (whistles) in the high frequencies.',
-        AI_TONE_DEF,
+        OUTLIER_DEF,
         'Each tone found gets a notch centred on it, twice as wide as the tone (at most 30 Hz), '
         'turned down by <i>Reduction</i>. Because the notches are so narrow, the music next to them '
         'is not affected. The <b>On</b> box turns this step off.',
@@ -2536,8 +2863,8 @@ TIPS = {
              'the tone list or raise <i>Search above</i>.')),
     'sens': _tip(
         'Sensitivity',
-        'How many dB a narrow, steady peak must stand above the median of the surrounding 600 Hz to '
-        'count as an AI tone. The number on the right is that threshold; it is drawn as the yellow '
+        'How many dB a narrow peak must stand above the median within Local median span to '
+        'count as an spectral outlier. The number on the right is that threshold; it is drawn as the yellow '
         'dashed line in the Tone close-up.',
         'Further right = lower threshold = fainter tones are caught too, but more chance of notching '
         'something musical. Gentle uses 5 dB, Normal 4 dB, Strong 3 dB.',
@@ -2550,7 +2877,7 @@ TIPS = {
         _use('leave it at −40 dB unless a tone stays audible; then go deeper.')),
     'minhz': _tip(
         'Search above',
-        'Tones are only searched for above this frequency. AI tones sit mostly above 5 kHz; below '
+        'Tones are only searched for above this frequency. spectral outliers sit mostly above 5 kHz; below '
         'that, steady peaks are usually real notes, bass or synth drones.',
         _use('lower it only if you hear a whistle below this frequency; raise it if real sustained '
              'notes are being notched.')),
@@ -2560,14 +2887,14 @@ TIPS = {
         'ones become visible once those are gone, and get notched too.',
         _use('keep it on; turn it off only for the gentlest possible clean.')),
     'detect': _tip(
-        'Auto-detect tones',
-        'Searches this track for AI tones with the current Sensitivity and Search above, and '
+        'Detect outliers',
+        'Searches this track for spectral outliers with the current Sensitivity and Search above, and '
         'replaces the tone list with what is found. Hand edits to the list are lost.',
         _use('press it after changing Sensitivity or Search above on a track whose list you edited, '
              'or when the list came from another track.')),
     'show_list': _tip(
         'Tone list',
-        'Shows or hides the list of notches, one per AI tone.',
+        'Shows or hides the list of notches, one per spectral outlier.',
         _use('open it to check what was found, switch single tones off, fix a frequency or width, '
              'or add tones by hand.')),
     'notch_table': _tip(
@@ -2626,7 +2953,7 @@ TIPS = {
     # ── Save ────────────────────────────────────────────────
     'save_card': _tip(
         'Save',
-        'Writes files to the output folder. Format and name suffix are set in the Settings menu.',
+        'Writes files to the output folder. Format and name suffix are set in Settings > Export.',
         items=(('Save', 'the cleaned track (B)'),
                ('Save Removed', 'only what was removed'),
                ('Save All…', 'clean and save every track in the list'))),
@@ -2685,12 +3012,12 @@ TIPS = {
     'profile': _tip(
         'Noise profile (Adaptive)',
         'Where the steady background is measured — the whole track, or a region you picked.',
-        _use('drag across a quiet part of the Tone lines view where the tones are clearly audible '
+        _use('drag across a quiet part of the spectrogram where the tones are clearly audible '
              'but little music plays (an intro or outro works well).')),
     'profile_clear': _tip('Whole track', 'Measures the noise profile over the whole track again.'),
     'stereo': _tip(
         'Stereo',
-        'How left and right are treated. AI tones usually sit dead-centre (the same in both '
+        'How left and right are treated. spectral outliers usually sit dead-centre (the same in both '
         'channels) while music is spread wide.',
         _use('keep L / R. If B sounds narrower than A, try Mid only or Coherence — they leave the '
              'stereo width alone.'),
@@ -2726,11 +3053,9 @@ TIPS = {
                ('MP3 320 kbps', 'small, lossy'),
                ('Same as input', 'keeps WAV / FLAC / AIFF / MP3; others become FLAC 24-bit'))),
     'set_detect': _tip(
-        'Auto-detect on open',
-        'On: every track gets its own AI tones found when you open it (recommended — tones differ '
-        'per track).',
-        'Off: every track uses the last tone list you had. Press Auto-detect tones to find them for '
-        'the current track.'),
+        'Re-detect fixed cuts on open',
+        'New tracks always get their own initial detection. Returning to a track restores its saved config.',
+        'Enable this to refresh automatic fixed cuts when reopening a track. Manual cuts and EQ curves are kept.'),
     'set_gpu': _tip(
         'Process on the GPU',
         'Runs the heavy FFT work on an NVIDIA graphics card through PyTorch + CUDA — several times '
@@ -2766,7 +3091,7 @@ TIPS = {
         'stay as they are.'),
     'b_detect': _tip(
         'Find tones per track',
-        'Each track gets its own AI tones found. Recommended: tones differ from track to track, '
+        'Each track gets its own spectral outliers found. Recommended: tones differ from track to track, '
         'even from the same generator.'),
     'b_list': _tip(
         'Use the current tone list',
@@ -2782,6 +3107,28 @@ TIPS = {
         'Writes a second file per track with only what was removed (…_removed).'),
 }
 TIPS['b_format'] = TIPS['set_format']
+TIPS.update({
+    'spectrum': _tip('Live spectrum and EQ',
+        'The white curve is the current audio frame selected by A/B or residual solo. '
+        'The dark accent-colored background retains recent peak amplitudes with a slow fade. '
+        'Scrubbing previews the current frame while preserving peaks; set the fade speed in Settings > Analyzer.',
+        'Colored EQ bands show maximum permitted gain. The yellow line is the current rendered EQ response. Show fixed cuts optionally shows legacy automatic notches '
+        'as a subdued overlay; Outliers shows exact individual outliers. The left axis is dBFS; the right is EQ gain.',
+        _use('double-click to add the chosen shape. Drag its handle for frequency / height; '
+             'wheel changes width; right-drag changes width / plateau; Alt+wheel scales the whole curve. '
+             'Ctrl+wheel zooms, middle-drag pans. Ctrl/Shift-click selects curves together. '
+             'Soften highs mode keeps the original left / right endpoint editing.')),
+    'colours': _tip('Analyzer colours',
+        'White = current amplitudes; dark accent fill = slowly fading peaks; '
+        'yellow = EQ response. Coloured handles select individual curves.'),
+    'lower_view': _tip('One display',
+        'Live spectrum, Outlier detail and Outliers over time share the same large display.'),
+    'spec_view': _tip('Frequency range', 'Full range shows 20 Hz to Nyquist. Outlier band zooms to the search region.'),
+    'zoom_band': _tip('Outlier band', 'Zoom to the region used to search for spectral outliers.'),
+    'tones': _tip('Spectral outliers — automatic', OUTLIER_DEF,
+        _use('adjust the detector rules, then compare A/B and listen to the residual. '
+             'Changes to detector rules trigger a fresh detection.')),
+})
 
 
 class RichToolTip(QObject):
@@ -2794,15 +3141,15 @@ class RichToolTip(QObject):
         self.win = QFrame(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
         self.win.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.win.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.win.setStyleSheet('QFrame { background-color: #181825; border: 1px solid #89b4fa; }'
-                               'QLabel { background: transparent; border: none; color: #cdd6f4; }')
+        self.win.setStyleSheet('QFrame { background-color: #262626; border: 1px solid #777777; }'
+                               'QLabel { background: transparent; border: none; color: #dddddd; }')
         lay = QVBoxLayout(self.win)
         lay.setContentsMargins(14, 10, 14, 12)
         self.label = QLabel()
         self.label.setTextFormat(Qt.TextFormat.RichText)
         self.label.setWordWrap(True)
         font = QFont('Segoe UI')
-        font.setPixelSize(13)
+        font.setPixelSize(15)
         self.label.setFont(font)
         lay.addWidget(self.label)
         self._owner = None
@@ -2901,6 +3248,25 @@ def _transport_icon(kind: str, color: str, size: int = 12) -> QIcon:
     return QIcon(pm)
 
 
+def _curve_icon(kind: str) -> QIcon:
+    pm = QPixmap(88, 36)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QColor('#45475a'))
+    painter.drawLine(3, 18, 85, 18)
+    c = normalize_curve(dict(type=kind, freq=1000., gain=12., width=3.))
+    db = curve_gain_db(np.geomspace(100., 10000., 80), c)
+    painter.setPen(QColor('#cccccc'))
+    pen = painter.pen()
+    pen.setWidthF(2.5)
+    painter.setPen(pen)
+    painter.drawPolyline(QPolygonF([QPointF(4 + i, 18 - value) for i, value in enumerate(db)]))
+    painter.end()
+    pm.setDevicePixelRatio(2.)
+    return QIcon(pm)
+
+
 class Card(QFrame):
     """A panel section: header (collapse arrow, optional on/off box, title) inside
     the card, body below. Unchecked → body disabled, like a checkable QGroupBox."""
@@ -2910,8 +3276,8 @@ class Card(QFrame):
     def __init__(self, title: str, parent=None, collapsible: bool = True):
         super().__init__(parent)
         self.setObjectName('card')
-        self._icon_open   = _transport_icon('down', C['orig'], 10)
-        self._icon_closed = _transport_icon('right', C['orig'], 10)
+        self._icon_open   = _transport_icon('down', '#cccccc', 10)
+        self._icon_closed = _transport_icon('right', '#cccccc', 10)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 6, 10, 8)
         outer.setSpacing(6)
@@ -3011,7 +3377,19 @@ class WheelTrapTable(QTableWidget):
         event.accept()
 
 
-class MainWindow(QMainWindow):
+from workspace_ui import StudioWorkspaceMixin
+from ui_widgets import COLOR_PROFILES, SPECTRUM_ACCENTS
+
+
+class MainWindow(StudioWorkspaceMixin, QMainWindow):
+    TIPS = TIPS
+    CURVE_TYPES = CURVE_TYPES
+    make_spectrum = staticmethod(SpectrumCanvas)
+    make_closeup = staticmethod(ToneCloseupCanvas)
+    make_tone_view = staticmethod(ToneLinesCanvas)
+    make_click_slider = staticmethod(ClickSlider)
+    transport_icon = staticmethod(_transport_icon)
+    curve_icon = staticmethod(_curve_icon)
     gpu_ready = pyqtSignal()
 
     # Built exe: data folders sit next to the exe. From source: the project root.
@@ -3028,6 +3406,11 @@ class MainWindow(QMainWindow):
     DIFF_SUFFIX    = '_removed'
 
     _FIELD_LABELS = {
+        'edit_mode': 'Shaping mode', 'eq_curves': 'EQ curves',
+        'floor_hz': 'Local median span', 'max_fwhm_hz': 'Max peak width',
+        'max_hz': 'Search below', 'min_level_db': 'Minimum level',
+        'steady_pct': 'Time percentile', 'notch_cap_hz': 'Max notch width',
+        'max_outliers': 'Maximum outliers',
         'tones_on': 'Remove tones', 'threshold_db': 'Threshold', 'min_hz': 'Search above',
         'second_pass': 'Second pass', 'tone_depth_db': 'Tone reduction',
         'shelf_on': 'Top band', 'fade_start': 'Fade from', 'cutoff': 'Full from', 'curve': 'Curve',
@@ -3037,13 +3420,15 @@ class MainWindow(QMainWindow):
         'profile_region': 'Noise profile',
     }
     _FIELD_UNITS = {
+        'floor_hz': ' Hz', 'max_fwhm_hz': ' Hz', 'max_hz': ' Hz',
+        'min_level_db': ' dB', 'steady_pct': ' %', 'notch_cap_hz': ' Hz',
         'threshold_db': ' dB', 'tone_depth_db': ' dB', 'shelf_depth_db': ' dB', 'min_hz': ' Hz',
         'fade_start': ' Hz', 'cutoff': ' Hz', 'attack_ms': ' ms', 'release_ms': ' ms',
         'percentile': ' %', 'oversub': '×',
     }
 
     _MODE_COLORS = {'orig': C['orig'], 'proc': C['proc'], 'res': C['res'], 'cmp': C['cmp']}
-    _RESULT_KEYS = ('audio', 'boost', 'psd_f', 'psd_proc', 'prom_proc', 'view_proc', 'view_res',
+    _RESULT_KEYS = ('audio', 'boost', 'psd_f', 'psd_proc', 'prom_proc', 'view_proc', 'view_res', 'eq_trace',
                     'tones_before', 'tones_after', 'energy_pct', 'flatness')
     VERSION_MEM = 4   # rendered versions kept in RAM besides the temp folder
 
@@ -3074,6 +3459,12 @@ class MainWindow(QMainWindow):
             old = QSettings('HighFrequencyCleaner', 'HighFrequencyCleaner')
             for k in old.allKeys():
                 self._settings.setValue(k, old.value(k))
+        self.color_profile = self._settings.value('color_profile', 'dark', type=str)
+        if self.color_profile not in COLOR_PROFILES:
+            self.color_profile = 'dark'
+        self.spectrum_accent = self._settings.value('spectrum_accent', 'blue', type=str)
+        if self.spectrum_accent not in SPECTRUM_ACCENTS:
+            self.spectrum_accent = 'blue'
         self.name_suffix    = self._settings.value('name_suffix', self.DEFAULT_SUFFIX, type=str)
         self.export_format  = self._settings.value('export_format', 'wav24', type=str)
         if self.export_format not in EXPORT_FORMATS:
@@ -3087,6 +3478,9 @@ class MainWindow(QMainWindow):
         if last_notches:
             self.fs.notches = FilterSettings.from_dict({'notches': read_json_text(last_notches, [])}).notches
         self._manual_notches: dict = {}   # path → hand-edited tone list
+        self._track_detected = False
+        self._copied_config = None
+        self._loading_track = False
         self._detect_cache:   dict = {}   # (path, detect settings) → detected tone list
 
         # ── History / user presets ───────────────────────────
@@ -3128,7 +3522,7 @@ class MainWindow(QMainWindow):
         self._cb_playing: bool  = False
         self._slot:       int   = 1        # 0=A original  1=B  2…=C, D … (start on B: hear the result)
         self._solo_residual: bool = False
-        self._cb_volume:  float = 0.85
+        self._cb_volume: float = max(0, min(100, self._settings.value('volume', 85, type=int))) / 100.0
 
         # ── Playback ─────────────────────────────────────────
         self._stream: sd.OutputStream | None = None
@@ -3142,13 +3536,14 @@ class MainWindow(QMainWindow):
         self._proc_generation = 0
         self._load_generation = 0
         self._pending_detect  = False
+        self._auto_curve_requested = False
         self._updating  = False    # True while controls are set from code
         self._table_updating = False
 
         # ── Build ────────────────────────────────────────────
         self._build_menu()
         self._build_ui()
-        self.setStyleSheet(DARK_QSS)
+        self._apply_appearance()
         self._settings_to_controls()
         self._connect_signals()
         self._refresh_history_list()
@@ -3156,7 +3551,8 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self._pos_timer = QTimer(self)
-        self._pos_timer.setInterval(40)
+        self._pos_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._pos_timer.setInterval(6)  # 166 Hz target; Qt coalesces paint requests.
         self._pos_timer.timeout.connect(self._poll_position)
 
         self._clean_debounce = QTimer(self)
@@ -3199,262 +3595,65 @@ class MainWindow(QMainWindow):
     def _open_settings(self):
         dlg = SettingsDialog(self, self.name_suffix, self.export_format,
                              self.detect_on_load, GPU.enabled, self._hist_lines, self._hist_clear)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.use_gpu() is not None:
-                GPU.enabled = dlg.use_gpu()
-                GPU.last_error = ''
-                self._settings.setValue('use_gpu', GPU.enabled)
-                self._update_device_label()
-            self.name_suffix    = dlg.suffix()
-            self.export_format  = dlg.fmt_key()
-            self.detect_on_load = dlg.detect_on_load()
-            self._settings.setValue('name_suffix', self.name_suffix)
-            self._settings.setValue('export_format', self.export_format)
-            self._settings.setValue('detect_on_load_v2', self.detect_on_load)
-            self._hist_lines = dlg.history_lines()
-            self._hist_clear = dlg.history_clear()
-            for k, v in self._hist_lines.items():
-                self._settings.setValue(f'history_line_{k}', v)
-            self._settings.setValue('history_clear', self._hist_clear)
-            self._update_export_label()
-            self._refresh_history_list()
+        dlg.exec()
 
-    def _build_ui(self):
-        root = QWidget()
-        self.setCentralWidget(root)
-        rl = QHBoxLayout(root)
-        rl.setContentsMargins(10, 10, 10, 6)
-        rl.setSpacing(10)
+    def _show_spectrum_help(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Spectrum and EQ help')
+        dlg.resize(660, 560)
+        root = QVBoxLayout(dlg)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        text = QLabel(
+            '<h3>Spectrum</h3>Live sound level by frequency. White is the current audio; the darker curve holds peaks. '
+            'Double-click to add an EQ band. Drag band handles to edit frequency and gain; scroll to change width.'
+            '<h3>Outliers</h3>Find frequencies that stand above their local surroundings. Blue and green show '
+            'whole-track original and cleaned measurements. The white line follows the audio at the playhead. '
+            'The dashed line is the detector threshold, not a guarantee of audibility. '
+            'Scroll to zoom; middle-drag to pan; double-click to reset. Right-click to add a fixed notch.'
+            '<h3>Spectrogram</h3>Outlier strength over the whole track: time runs horizontally and frequency vertically. '
+            'Brightness measures dB above the local spectral floor, rather than absolute volume. '
+            'The white cursor follows playback and seeking. It shows the selected A/B version or removed audio. '
+            'Click to seek, Shift-drag to set a loop, scroll to zoom frequency, double-click to reset. '
+            'Right-click adds a fixed notch; ordinary dragging selects a noise-profile region for adaptive processing.'
+            '<h3>Processing</h3><b>EQ curves</b> targets individual frequency bands. <b>Soften highs</b> reduces a broad '
+            'high-frequency range; choose its start, end and depth in Settings &gt; Processing. '
+            'Use it for overall harshness; use EQ curves for specific tones.'
+            '<p><b>Presets:</b> Gentle detects stronger outliers, Normal uses two passes, Strong also detects fainter '
+            'outliers. In EQ mode they regenerate automatic dynamic bands while preserving manual bands. '
+            'In Soften highs mode they also choose the broad cut strength. Saved presets are available in the same selector.</p>'
+            '<p><b>Show fixed cuts</b> only displays the notch-filter response on the spectrum. '
+            'Enable filtering separately in Settings &gt; Outliers &gt; Fixed cuts. '
+            '<b>Auto curves</b> analyzes the track and creates up to six editable dynamic bands; it changes processing.</p>')
+        text.setWordWrap(True)
+        text.setMargin(16)
+        scroll.setWidget(text)
+        root.addWidget(scroll)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dlg.accept)
+        root.addWidget(buttons)
+        dlg.exec()
 
-        rl.addWidget(self._build_tracks_panel())
+    def _apply_app_settings(self, dlg):
+        if dlg.use_gpu() is not None and dlg.use_gpu() != GPU.enabled:
+            GPU.enabled = dlg.use_gpu()
+            GPU.last_error = ''
+            self._settings.setValue('use_gpu', GPU.enabled)
+            self._update_device_label()
+        self.name_suffix    = dlg.suffix()
+        self.export_format  = dlg.fmt_key()
+        self.detect_on_load = dlg.detect_on_load()
+        self._settings.setValue('name_suffix', self.name_suffix)
+        self._settings.setValue('export_format', self.export_format)
+        self._settings.setValue('detect_on_load_v2', self.detect_on_load)
+        self._hist_lines = dlg.history_lines()
+        self._hist_clear = dlg.history_clear()
+        for k, v in self._hist_lines.items():
+            self._settings.setValue(f'history_line_{k}', v)
+        self._settings.setValue('history_clear', self._hist_clear)
+        self._update_export_label()
+        self._refresh_history_list()
 
-        center = QWidget()
-        cl = QVBoxLayout(center)
-        cl.setContentsMargins(0, 0, 0, 0)
-        cl.setSpacing(8)
-
-        self.lbl_steps = QLabel()
-        self.lbl_steps.setObjectName('lbl_steps')
-        self.lbl_steps.setTextFormat(Qt.TextFormat.RichText)
-        self.lbl_steps.setToolTip(TIPS['workflow'])
-        cl.addWidget(self.lbl_steps)
-
-        self.view_frame = QFrame()
-        self.view_frame.setObjectName('view_frame')
-        vf = QVBoxLayout(self.view_frame)
-        vf.setContentsMargins(3, 3, 3, 3)
-        vf.setSpacing(2)
-
-        zoom_row = QHBoxLayout()
-        zoom_row.setContentsMargins(6, 2, 6, 0)
-        lbl_zoom = _hint('Spectrum view:', wrap=False)
-        lbl_zoom.setToolTip(TIPS['spec_view'])
-        zoom_row.addWidget(lbl_zoom)
-        self.btn_zoom_full = QPushButton('Full range')
-        self.btn_zoom_band = QPushButton('AI tone band')
-        self.btn_zoom_full.setToolTip(TIPS['zoom_full'])
-        self.btn_zoom_band.setToolTip(TIPS['zoom_band'])
-        for b in (self.btn_zoom_full, self.btn_zoom_band):
-            b.setObjectName('btn_small')
-            b.setCheckable(True)
-            zoom_row.addWidget(b)
-        self.btn_zoom_full.setChecked(True)
-        zoom_row.addStretch()
-        legend = _hint('Blue = original · Green = cleaned · Red = removed · '
-                       'small red ticks = tones found', wrap=False)
-        legend.setStyleSheet('font-size: 12px;')
-        legend.setToolTip(TIPS['colours'])
-        zoom_row.addWidget(legend)
-        vf.addLayout(zoom_row)
-
-        spec_pane = QWidget()
-        sp = QVBoxLayout(spec_pane)
-        sp.setContentsMargins(0, 0, 0, 0)
-        sp.setSpacing(2)
-        self.spectrum = SpectrumCanvas()
-        self.spectrum.setToolTip(TIPS['spectrum'])
-        sp.addWidget(self.spectrum, stretch=1)
-        pan_row = QHBoxLayout()
-        pan_row.setContentsMargins(6, 0, 6, 2)
-        lbl_pan = _hint('Pan', wrap=False)
-        lbl_pan.setFixedWidth(26)
-        pan_row.addWidget(lbl_pan)
-        self.slider_pan = QSlider(Qt.Orientation.Horizontal)
-        self.slider_pan.setRange(0, 10000)
-        self.slider_pan.setEnabled(False)
-        self.slider_pan.setToolTip(TIPS['pan'])
-        pan_row.addWidget(self.slider_pan)
-        sp.addLayout(pan_row)
-
-        lower = QWidget()
-        lw = QVBoxLayout(lower)
-        lw.setContentsMargins(0, 2, 0, 0)
-        lw.setSpacing(2)
-        view_row = QHBoxLayout()
-        view_row.setContentsMargins(6, 0, 6, 0)
-        lbl_lower = _hint('Lower view:', wrap=False)
-        lbl_lower.setToolTip(TIPS['lower_view'])
-        view_row.addWidget(lbl_lower)
-        self.btn_view_close = QPushButton('Tone close-up')
-        self.btn_view_lines = QPushButton('Tone lines over time')
-        self.view_group = QButtonGroup(self)
-        for b in (self.btn_view_close, self.btn_view_lines):
-            b.setObjectName('btn_small')
-            b.setCheckable(True)
-            self.view_group.addButton(b)
-            view_row.addWidget(b)
-        self.btn_view_close.setChecked(True)
-        self.btn_view_close.setToolTip(TIPS['closeup'])
-        self.btn_view_lines.setToolTip(TIPS['tonelines'])
-        view_row.addStretch()
-        lw.addLayout(view_row)
-        self.lower_stack = QStackedWidget()
-        self.closeup = ToneCloseupCanvas()
-        self.tone_view = ToneLinesCanvas()
-        self.lower_stack.addWidget(self.closeup)
-        self.lower_stack.addWidget(self.tone_view)
-        lw.addWidget(self.lower_stack, stretch=1)
-
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(spec_pane)
-        splitter.addWidget(lower)
-        splitter.setSizes([400, 280])
-        splitter.setChildrenCollapsible(False)
-        vf.addWidget(splitter)
-        cl.addWidget(self.view_frame, stretch=1)
-
-        self.lbl_busy = QLabel(self.view_frame)
-        self.lbl_busy.setObjectName('lbl_busy')
-        self.lbl_busy.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_busy.hide()
-        self.view_frame.installEventFilter(self)
-        self._update_view_mode()
-
-        cl.addWidget(self._build_transport())
-        rl.addWidget(center, stretch=1)
-        rl.addWidget(self._build_controls_panel())
-
-        self.lbl_device = QLabel('Checking for GPU …')
-        self.lbl_device.setStyleSheet(f'color: {C["off"]}; padding: 0 8px;')
-        self.statusBar().addPermanentWidget(self.lbl_device)
-        self.statusBar().showMessage('Load a track to begin.')
-
-    def _build_tracks_panel(self) -> QWidget:
-        left = QWidget()
-        left.setFixedWidth(230)
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 0, 0)
-        ll.setSpacing(6)
-
-        hdr = QLabel('TRACKS')
-        hdr.setObjectName('lbl_section')
-        ll.addWidget(hdr)
-
-        self.file_list = QListWidget()
-        self.file_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self.file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.file_list.setToolTip(TIPS['tracks'])
-        ll.addWidget(self.file_list, stretch=1)
-
-        self.lbl_track = QLabel('No track loaded')
-        self.lbl_track.setWordWrap(True)
-        self.lbl_track.setStyleSheet('color: #a6adc8; font-size: 11px; padding: 4px;')
-        self.lbl_track.setToolTip(TIPS['loaded_track'])
-        ll.addWidget(self.lbl_track)
-
-        btn_add = QPushButton('+ Add Files…')
-        btn_add.setToolTip(TIPS['add_files'])
-        btn_add.clicked.connect(self._browse_files)
-        ll.addWidget(btn_add)
-        ll.addWidget(_hint('Or drag & drop audio files onto the window.'))
-        return left
-
-    def _build_transport(self) -> QFrame:
-        frame = QFrame()
-        frame.setObjectName('transport')
-        pb = QVBoxLayout(frame)
-        pb.setContentsMargins(10, 8, 10, 8)
-        pb.setSpacing(6)
-
-        tl = QHBoxLayout()
-        self.lbl_time_cur = QLabel('0:00')
-        self.lbl_time_cur.setFixedWidth(40)
-        self.lbl_time_cur.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        tl.addWidget(self.lbl_time_cur)
-        self.slider_pos = ClickSlider(Qt.Orientation.Horizontal)
-        self.slider_pos.setRange(0, 10000)
-        self.slider_pos.setToolTip(TIPS['position'])
-        tl.addWidget(self.slider_pos)
-        self.lbl_time_tot = QLabel('0:00')
-        self.lbl_time_tot.setFixedWidth(40)
-        tl.addWidget(self.lbl_time_tot)
-        pb.addLayout(tl)
-
-        br = QHBoxLayout()
-        br.setSpacing(8)
-        self._icon_play  = _transport_icon('play', '#1e1e2e')
-        self._icon_pause = _transport_icon('pause', '#1e1e2e')
-        self.btn_play = QPushButton(' Play')
-        self.btn_play.setIcon(self._icon_play)
-        self.btn_play.setObjectName('btn_primary')
-        self.btn_play.setMinimumWidth(96)
-        self.btn_play.setEnabled(False)
-        self.btn_play.setToolTip(TIPS['play'])
-        br.addWidget(self.btn_play)
-
-        self.btn_stop = QPushButton(' Stop')
-        self.btn_stop.setIcon(_transport_icon('stop', '#cdd6f4'))
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.setToolTip(TIPS['stop'])
-        br.addWidget(self.btn_stop)
-
-        br.addSpacing(12)
-        label, obj = self._slot_label()
-        self.btn_ab = QPushButton(label)
-        self.btn_ab.setObjectName(obj)
-        self.btn_ab.setMinimumWidth(120)
-        self.btn_ab.setEnabled(False)
-        self.btn_ab.setToolTip(TIPS['ab'])
-        br.addWidget(self.btn_ab)
-
-        self.btn_solo = QPushButton('Hear Removed')
-        self.btn_solo.setObjectName('btn_ab_c')
-        self.btn_solo.setEnabled(False)
-        self.btn_solo.setCheckable(True)
-        self.btn_solo.setToolTip(TIPS['solo'])
-        br.addWidget(self.btn_solo)
-
-        br.addSpacing(12)
-        self.btn_loop = QPushButton('Loop')
-        self.btn_loop.setObjectName('btn_loop')
-        self.btn_loop.setCheckable(True)
-        self.btn_loop.setChecked(self._loop_on)
-        self.btn_loop.setToolTip(TIPS['loop'])
-        br.addWidget(self.btn_loop)
-        self.btn_loop_sec = QPushButton('Loop Section')
-        self.btn_loop_sec.setToolTip(TIPS['loop_sec'])
-        br.addWidget(self.btn_loop_sec)
-        self.lbl_loop = QLabel('')
-        self.lbl_loop.setStyleSheet(f'color: {C["loop"]};')
-        br.addWidget(self.lbl_loop)
-
-        br.addStretch()
-        keys = _hint('Space ▶ · Tab A/B · R removed · L loop · ◀/▶ 5 s', wrap=False)
-        keys.setToolTip(TIPS['keys'])
-        br.addWidget(keys)
-        br.addSpacing(12)
-        lbl_vol = QLabel('Vol')
-        br.addWidget(lbl_vol)
-        self.slider_vol = ClickSlider(Qt.Orientation.Horizontal)
-        self.slider_vol.setRange(0, 100)
-        self.slider_vol.setValue(85)
-        self.slider_vol.setFixedWidth(100)
-        tip = TIPS['volume']
-        lbl_vol.setToolTip(tip)
-        self.slider_vol.setToolTip(tip)
-        br.addWidget(self.slider_vol)
-        pb.addLayout(br)
-        return frame
 
     def _slider_row(self, grid: QGridLayout, row: int, label: str, lo: int, hi: int,
                     tooltip: str, color: str | None = None) -> tuple[QSlider, QLabel]:
@@ -3480,6 +3679,180 @@ class MainWindow(QMainWindow):
         card.collapsed_changed.connect(
             lambda on: self._settings.setValue(f'card_collapsed/{key}', bool(on)))
         return card
+
+
+    def _show_diagnostic(self, index):
+        self.lower_stack.setCurrentIndex(index)
+        self.display_stack.setCurrentIndex(1)
+        self._sync_view_controls()
+
+    def _refresh_filter_response(self, curves=None):
+        s = self.fs
+        f = np.geomspace(20., self.spectrum.max_freq, 1800)
+        # Add fine samples around detected notches so narrow cuts remain visible
+        # even on a logarithmic frequency axis.
+        if self.spectrum.show_auto_cuts and s.tones_on and s.notches:
+            fine = np.concatenate([float(n['freq']) + np.linspace(-2, 2, 17) * float(n['width'])
+                                   for n in s.notches if n.get('on', True)] or [np.array([])])
+            f = np.unique(np.concatenate((f, fine[(fine >= 20) & (fine <= self.spectrum.max_freq)])))
+        db = (combined_gain_db(f, s.eq_curves if curves is None else curves) if s.edit_mode == 'curves'
+              else self.processor.shelf_gain_db(f, s))
+        auto_db = np.zeros_like(f)
+        if s.tones_on and self.spectrum.show_auto_cuts:
+            w = FilterProcessor.notch_weight(f, s.notches)
+            auto_db = 20. * np.log10(np.maximum(1. - w * (1. - 10. ** (s.tone_depth_db / 20.)), 1e-6))
+        display = replace(s, eq_curves=s.eq_curves if curves is None else curves)
+        display._display_auto_response = auto_db
+        self.spectrum.set_filter_response(display, f, db)
+
+    def _refresh_curve_controls(self, curves=None):
+        curves = self.fs.eq_curves if curves is None else curves
+        index = self.spectrum.selected_curve
+        previous = self._updating
+        self._updating = True
+        self.combo_eq_bands.blockSignals(True)
+        self.combo_eq_bands.clear()
+        names = dict((key, title) for title, key in CURVE_TYPES)
+        for i, c in enumerate(curves):
+            self.combo_eq_bands.addItem(f'{i+1} · {names[c["type"]]} · {c["freq"]:,.0f} Hz' +
+                                        ('' if c['on'] else ' · off'))
+        self.combo_eq_bands.setCurrentIndex(index)
+        self.combo_eq_bands.setPlaceholderText('No curve selected')
+        self.combo_eq_bands.blockSignals(False)
+        selected = 0 <= index < len(curves)
+        count = len(self.spectrum.selected_curves)
+        self.btn_curve_remove.setText(f'Delete {count}' if count > 1 else 'Delete')
+        self.curve_selection_label.setText(
+            f'{count} curves selected · controls are relative to band {index+1}' if count > 1
+            else 'Drag to move · wheel for width · Ctrl/Shift-click to select multiple')
+        self.btn_curve_remove.setEnabled(selected)
+        self.chk_curve_on.setEnabled(selected)
+        for spin in self.curve_controls.values():
+            spin.setEnabled(selected)
+        if selected:
+            c = curves[index]
+            self.chk_curve_on.setChecked(c['on'])
+            self._select_data(self.combo_eq_type, c['type'])
+            for key, spin in self.curve_controls.items():
+                spin.setValue(c[key] * (100 if key in ('scale', 'plateau') else 1))
+            self.curve_controls['plateau'].setEnabled(c['type'] in ('bell', 'notch', 'band_pass'))
+            self.curve_effective_label.setText(
+                f"Effective maximum: {c['gain']*c['scale']:+.1f} dB · "
+                f"Effective width: {c['width']*c['scale']:.2f} oct  |  Scale both multiplies width and gain")
+        for key, control in self.rotary_controls.items():
+            control.dial.setEnabled(self.curve_controls[key].isEnabled())
+        if selected:
+            self.chk_curve_dynamic.setChecked(c['dynamic'])
+            for key, spin in self.dynamic_controls.items():
+                spin.setValue(c[key])
+        self.chk_curve_dynamic.setEnabled(selected)
+        for spin in self.dynamic_controls.values():
+            spin.setEnabled(selected and self.chk_curve_dynamic.isChecked())
+        self._sync_editor_visibility()
+        self._refresh_band_chips()
+        self._updating = previous
+
+    def _select_curve(self, index, additive=False):
+        if self._updating:
+            return
+        # A canvas gesture has already updated its multi-selection.
+        if self.sender() is not self.spectrum:
+            self.spectrum.select_curve(index, additive)
+        self._refresh_curve_controls()
+
+    def _add_curve(self, freq, kind=None):
+        kind = kind or self.combo_eq_type.currentData() or 'bell'
+        gain = -24. if kind in ('notch', 'low_cut', 'high_cut', 'band_pass') else -6.
+        c = normalize_curve(dict(type=kind, freq=min(freq, self.spectrum.max_freq), gain=gain,
+                                 width=.15 if kind == 'notch' else 1.))
+        curves = [dict(c) for c in self.fs.eq_curves] + [c]
+        self.spectrum.selected_curve = len(curves) - 1
+        self.spectrum.selected_curves = {len(curves) - 1}
+        self._on_curves_edited(curves)
+
+    def _remove_curve(self):
+        index = self.spectrum.selected_curve
+        if 0 <= index < len(self.fs.eq_curves):
+            curves = [dict(c) for c in self.fs.eq_curves]
+            selection = self.spectrum.selected_curves or {index}
+            curves = [c for i, c in enumerate(curves) if i not in selection]
+            if not curves:
+                self.fs.auto_eq = False
+            self.spectrum.selected_curve = min(index, len(curves) - 1)
+            self.spectrum.selected_curves = ({self.spectrum.selected_curve}
+                                            if self.spectrum.selected_curve >= 0 else set())
+            self._on_curves_edited(curves)
+
+    def _on_curve_controls(self, *_):
+        if self._updating:
+            return
+        index = self.spectrum.selected_curve
+        if not 0 <= index < len(self.fs.eq_curves):
+            return
+        c = {**self.fs.eq_curves[index], **{key: spin.value() / (100 if key in ('scale', 'plateau') else 1)
+             for key, spin in self.curve_controls.items()}}
+        c.update({key: spin.value() for key, spin in self.dynamic_controls.items()})
+        c['dynamic'] = self.chk_curve_dynamic.isChecked()
+        c['auto'] = False  # A manually adjusted suggestion is now a manual band.
+        c.update(type=self.combo_eq_type.currentData(), on=self.chk_curve_on.isChecked())
+        if c['type'] in ('notch', 'low_cut', 'high_cut', 'band_pass'):
+            c['gain'] = -abs(c['gain'])
+        curves = [dict(c) for c in self.fs.eq_curves]
+        original = curves[index]
+        changed = {key for key in c if c[key] != original.get(key) and key != 'auto'}
+        sender = self.sender()
+        control_keys = {spin: key for key, spin in {**self.curve_controls, **self.dynamic_controls}.items()}
+        control_keys.update({self.chk_curve_dynamic: 'dynamic', self.chk_curve_on: 'on',
+                             self.combo_eq_type: 'type'})
+        if sender in control_keys:
+            changed &= {control_keys[sender]}
+        for i in self.spectrum.selected_curves or {index}:
+            target = {**curves[i], 'auto': False}
+            for key in changed:
+                if key in ('freq', 'width', 'scale'):
+                    target[key] *= c[key] / original[key]
+                elif key in ('gain', 'plateau', 'threshold', 'ratio', 'attack', 'release'):
+                    target[key] += c[key] - original[key]
+                else:
+                    target[key] = c[key]
+            if target['type'] in ('notch', 'low_cut', 'high_cut', 'band_pass'):
+                target['gain'] = -abs(target['gain'])
+            curves[i] = normalize_curve(target)
+        self._on_curves_edited(curves)
+
+    def _on_curves_preview(self, curves):
+        self._refresh_filter_response(curves)
+        self._refresh_curve_controls(curves)
+
+    def _on_curves_edited(self, curves):
+        self.fs.eq_curves = [normalize_curve(c) for c in curves]
+        self.fs.preset = 'custom'
+        self._show_custom_preset()
+        self._refresh_filter_response()
+        self._refresh_curve_controls()
+        self._save_filter_settings()
+        self._request_clean(detect=False)
+
+    def _request_auto_curves(self):
+        if self._audio_orig is None:
+            self._set_status('Open a track first, then Auto curves finds an editable starting set.')
+            return
+        self._auto_curve_requested = True
+        self.fs.auto_eq = True
+        self._request_clean(detect=False, delay=0)
+
+    def _on_edit_mode(self, *_):
+        if self._updating:
+            return
+        mode = self.combo_edit_mode.currentData()
+        self.box_shelf.setVisible(mode == 'range')
+        self.curve_body.setVisible(mode == 'curves')
+        self.curve_actions.setVisible(mode == 'curves' and self.display_stack.currentIndex() == 0)
+        self._on_control('edit_mode', mode, detect=False)
+        self._refresh_filter_response()
+        self._sync_editor_visibility()
+        if mode == 'range' and not isinstance(QApplication.activeModalWidget(), SettingsDialog):
+            self._show_inspector('advanced')
 
     def _build_controls_panel(self) -> QScrollArea:
         panel = QWidget()
@@ -3523,6 +3896,8 @@ class MainWindow(QMainWindow):
         bp.addLayout(ur)
         lay.addWidget(box_p)
 
+        self._build_curve_controls(lay)
+
         # ── Result ───────────────────────────────────────────
         box_q = self._card('Result', 'result')
         box_q.setToolTip(TIPS['result'])
@@ -3531,7 +3906,7 @@ class MainWindow(QMainWindow):
         self.lbl_tones_big = QLabel('—')
         self.lbl_tones_big.setObjectName('lbl_big')
         bq.addWidget(self.lbl_tones_big, 0, 0, 1, 2)
-        self.lbl_tones_sub = _hint('AI tones found → still audible after cleaning')
+        self.lbl_tones_sub = _hint('spectral outliers found → still audible after cleaning')
         tip = TIPS['tones_count']
         self.lbl_tones_big.setToolTip(tip)
         self.lbl_tones_sub.setToolTip(tip)
@@ -3597,9 +3972,12 @@ class MainWindow(QMainWindow):
                            'Ctrl+Z / Ctrl+Y load the settings one step back / forward.'))
         lay.addWidget(box_h)
 
-        # ── 1 · AI tones ─────────────────────────────────────
-        self.box_tones = self._card('1 · Remove AI tones', 'tones')
+        # ── 1 · spectral outliers ─────────────────────────────────────
+        self.box_tones = self._card('Outlier detection', 'tones')
         self.box_tones.setCheckable(True)
+        self.box_tones.chk.setText('Fixed cuts')
+        self.box_tones.chk.setToolTip('Optional legacy fixed notch stage. Dynamic curves have their own per-band controls above the graph.')
+        self.box_tones.toggled.connect(lambda _: self.box_tones.body.setEnabled(True))
         self.box_tones.setToolTip(TIPS['tones'])
         bt = QVBoxLayout(self.box_tones.body)
         bt.setSpacing(6)
@@ -3621,18 +3999,51 @@ class MainWindow(QMainWindow):
         self.spin_minhz.setKeyboardTracking(False)
         self.spin_minhz.setToolTip(TIPS['minhz'])
         g.addWidget(self.spin_minhz, 2, 1, 1, 2)
+        self.spin_minhz.setRange(20, 96000)
+        self.detector_controls = {}
+        detector_specs = [
+            ('max_hz', 'Search below', 20, 96000, 500, ' Hz',
+             'Upper search limit, also limited by the track’s Nyquist frequency.'),
+            ('floor_hz', 'Local median span', 20, 5000, 50, ' Hz',
+             'Width of the frequency neighbourhood used to estimate the local floor. '
+             '600 Hz was the previous fixed default; it is a heuristic, not a property of AI audio.'),
+            ('max_fwhm_hz', 'Max peak width', 3, 1000, 1, ' Hz',
+             'Reject peaks wider than this at half prominence (FWHM). Previously fixed at 40 Hz.'),
+            ('steady_pct', 'Time percentile', 10, 90, 5, ' %',
+             '50% uses the median power over time. Lower percentiles favour more persistent tones; '
+             'higher values include more intermittent peaks.'),
+            ('min_level_db', 'Minimum level', -140, -20, 5, ' dB',
+             'Ignore bins below this level relative to the original spectrum’s maximum. '
+             'Previously fixed at −90 dB; this is not an absolute dBFS threshold.'),
+            ('notch_cap_hz', 'Max notch width', 3, 1000, 1, ' Hz',
+             'Cap the automatically generated notch widths. Previously fixed at 30 Hz.'),
+            ('max_outliers', 'Maximum outliers', 1, 2000, 10, '',
+             'Maximum number of peaks to remove; strongest peaks are kept first. Previously 400.'),
+        ]
+        for row, (key, title, lo, hi, step, suffix, tip) in enumerate(detector_specs, 3):
+            lbl = QLabel(title)
+            lbl.setToolTip(tip)
+            spin = QSpinBox()
+            spin.setRange(lo, hi)
+            spin.setSingleStep(step)
+            spin.setSuffix(suffix)
+            spin.setKeyboardTracking(False)
+            spin.setToolTip(tip)
+            self.detector_controls[key] = spin
+            g.addWidget(lbl, row, 0)
+            g.addWidget(spin, row, 1, 1, 2)
         bt.addLayout(g)
         self.chk_pass2 = QCheckBox('Second pass (catch leftovers)')
         self.chk_pass2.setToolTip(TIPS['pass2'])
         bt.addWidget(self.chk_pass2)
 
         tr = QHBoxLayout()
-        self.btn_detect = QPushButton('Auto-detect tones')
+        self.btn_detect = QPushButton('Detect outliers')
         self.btn_detect.setToolTip(TIPS['detect'])
         self.btn_detect.setObjectName('btn_small')
         self.btn_detect.setEnabled(False)
         tr.addWidget(self.btn_detect)
-        self.btn_show_list = QPushButton('Show tone list ▸')
+        self.btn_show_list = QPushButton('Show outlier list ▸')
         self.btn_show_list.setObjectName('btn_link')
         self.btn_show_list.setCheckable(True)
         self.btn_show_list.setToolTip(TIPS['show_list'])
@@ -3831,6 +4242,11 @@ class MainWindow(QMainWindow):
         self.lbl_device_adv.setToolTip(TIPS['runs_on'])
         ba.addWidget(self.lbl_device_adv, 5, 1, 1, 3)
         lay.addWidget(self.box_adv)
+        # Keep the two editing modes and the detector together, above history.
+        lay.removeWidget(self.box_tones)
+        lay.insertWidget(2, self.box_tones)
+        lay.removeWidget(self.box_shelf)
+        lay.insertWidget(3, self.box_shelf)
         lay.addStretch()
 
         for card in panel.findChildren(Card):
@@ -3840,6 +4256,11 @@ class MainWindow(QMainWindow):
             combo.setMinimumContentsLength(8)
             combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
+        self.inspector_cards = {
+            'strength': box_p, 'result': box_q, 'history': box_h,
+            'tones': self.box_tones, 'shelf': self.box_shelf,
+            'save': box_e, 'advanced': self.box_adv,
+        }
         scroll = QScrollArea()
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
@@ -3852,6 +4273,9 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event):
         if obj is self.view_frame and event.type() == QEvent.Type.Resize:
             self._place_busy()
+            self._position_curve_editor()
+            if hasattr(self, 'curve_legend'):
+                self.curve_legend.setVisible(self.view_frame.width() > 1050)
         return super().eventFilter(obj, event)
 
     def _place_busy(self):
@@ -3904,11 +4328,14 @@ class MainWindow(QMainWindow):
         self._refresh_preset_combo()
 
         self.box_tones.setChecked(s.tones_on)
+        self.box_tones.body.setEnabled(True)
         self.sl_sens.setValue(int(round(12 - s.threshold_db)))
         self.lbl_sens.setText(f'{s.threshold_db:.0f} dB')
         self.sl_tdepth.setValue(int(round(s.tone_depth_db)))
         self.lbl_tdepth.setText(f'{s.tone_depth_db:+.0f} dB')
         self.spin_minhz.setValue(int(s.min_hz))
+        for key, spin in self.detector_controls.items():
+            spin.setValue(int(getattr(s, key)))
         self.chk_pass2.setChecked(s.second_pass)
 
         self.box_shelf.setChecked(s.shelf_on)
@@ -3929,16 +4356,81 @@ class MainWindow(QMainWindow):
         self._select_data(self.combo_res, s.resolution)
         self._updating = False
 
-        self.spectrum.set_shelf(s.shelf_on, s.fade_start, s.cutoff)
+        self._updating = True
+        self._select_data(self.combo_edit_mode, s.edit_mode)
+        self._updating = False
+        self.box_shelf.setVisible(s.edit_mode == 'range')
+        self.curve_body.setVisible(s.edit_mode == 'curves')
+        self.curve_actions.setVisible(s.edit_mode == 'curves' and self.display_stack.currentIndex() == 0)
+        self._refresh_curve_controls()
+        self._refresh_filter_response()
         self._show_profile_region()
         self._update_resolution_label()
         self._update_export_label()
         self._refresh_notch_views()
 
     def _save_filter_settings(self):
-        """Knobs and the tone list — the next track and the next app start use both."""
+        """Persist the current track independently of defaults shown at startup."""
         self._settings.setValue('filter_settings_v2', self.fs.to_json())
         self._settings.setValue('last_notches', json.dumps(self.fs.notches))
+        if self.current_path:
+            document = dict(settings=self.fs.to_dict(), detected=self._track_detected,
+                            manual=self.current_path in self._manual_notches)
+            self._settings.setValue(self._track_config_key(self.current_path), json.dumps(document))
+
+    @staticmethod
+    def _track_config_key(path):
+        canonical = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+        return 'track_configs_v1/' + hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+    def _restore_track_config(self, path):
+        document = read_json_text(self._settings.value(self._track_config_key(path), '', type=str), {})
+        saved = isinstance(document, dict) and isinstance(document.get('settings'), dict)
+        self.fs = FilterSettings.from_dict(document['settings']) if saved else FilterSettings()
+        self._track_detected = bool(document.get('detected', False)) if saved else False
+        self._manual_notches.pop(path, None)
+        if saved and document.get('manual'):
+            self._manual_notches[path] = [dict(n) for n in self.fs.notches]
+        self._pending_detect = False
+        self._auto_curve_requested = False
+        self._hist_current = None
+        self.spectrum.select_curve(-1)
+        self._settings_to_controls()
+
+    def _update_config_buttons(self):
+        ready = bool(self.current_path and self._audio_orig is not None and not self._loading_track)
+        self.btn_copy_config.setEnabled(ready)
+        self.btn_paste_config.setEnabled(ready and self._copied_config is not None)
+
+    def _copy_track_config(self):
+        if not self.current_path or self._loading_track:
+            return
+        self._copied_config = dict(settings=self.fs.to_dict(), name=Path(self.current_path).name,
+                                   manual=self.current_path in self._manual_notches)
+        self._update_config_buttons()
+        self._set_status(f'Copied config from {self._copied_config["name"]}. Select a track and click Paste config.')
+
+    def _paste_track_config(self):
+        if self._copied_config is None or not self.current_path or self._loading_track:
+            return
+        self._proc_generation += 1  # Discard a render of the target's previous config.
+        self._hist_generation += 1
+        self._hist_pending = None
+        self._clean_debounce.stop()
+        self._pending_detect = False
+        self._auto_curve_requested = False
+        own_region = self.fs.profile_region
+        self.fs = FilterSettings.from_dict(self._copied_config['settings'])
+        self.fs.profile_region = own_region  # Time selections belong to the target audio.
+        self._track_detected = True  # An intentional empty paste must also stay empty.
+        self._manual_notches.pop(self.current_path, None)
+        if self._copied_config['manual']:
+            self._manual_notches[self.current_path] = [dict(n) for n in self.fs.notches]
+        self.spectrum.select_curve(0 if self.fs.eq_curves else -1)
+        self._settings_to_controls()
+        self._save_filter_settings()
+        self._request_clean(detect=False, delay=0)
+        self._set_status(f'Pasted config from {self._copied_config["name"]} into {Path(self.current_path).name}.')
 
     # ── Signals ───────────────────────────────────────────────
 
@@ -3947,6 +4439,20 @@ class MainWindow(QMainWindow):
 
         self.spectrum.shelf_changed.connect(self._on_canvas_shelf)
         self.spectrum.notches_edited.connect(lambda n: self._set_notches(n, manual=True))
+        self.spectrum.curves_edited.connect(self._on_curves_edited)
+        self.spectrum.curves_preview.connect(self._on_curves_preview)
+        self.spectrum.curve_selected.connect(self._select_curve)
+        self.spectrum.add_curve_requested.connect(self._add_curve)
+        self.combo_edit_mode.currentIndexChanged.connect(self._on_edit_mode)
+        self.combo_eq_bands.currentIndexChanged.connect(self._select_curve)
+        self.btn_curve_remove.clicked.connect(self._remove_curve)
+        self.chk_curve_dynamic.toggled.connect(self._on_curve_controls)
+        for spin in self.dynamic_controls.values():
+            spin.valueChanged.connect(self._on_curve_controls)
+        self.chk_curve_on.toggled.connect(self._on_curve_controls)
+        self.combo_eq_type.currentIndexChanged.connect(self._on_curve_controls)
+        for spin in self.curve_controls.values():
+            spin.valueChanged.connect(self._on_curve_controls)
         self.spectrum.view_changed.connect(self._sync_pan_slider)
         self.slider_pan.sliderMoved.connect(self._on_pan_slider_moved)
         self.spectrum.view_changed.connect(self._sync_zoom_buttons)
@@ -3955,7 +4461,9 @@ class MainWindow(QMainWindow):
 
         self.tone_view.region_selected.connect(self._on_region_selected)
         self.closeup.add_notch_requested.connect(self._add_notch_at)
-        self.btn_view_close.toggled.connect(lambda on: self.lower_stack.setCurrentIndex(0 if on else 1))
+        self.btn_view_live.toggled.connect(lambda on: self.display_stack.setCurrentIndex(0) if on else None)
+        self.btn_view_close.toggled.connect(lambda on: self._show_diagnostic(0) if on else None)
+        self.btn_view_lines.toggled.connect(lambda on: self._show_diagnostic(1) if on else None)
         self.tone_view.add_notch_requested.connect(self._add_notch_at)
         self.tone_view.seek_requested.connect(
             lambda t: self._seek_to(int(t * self.sample_rate)) if self._audio_orig is not None else None)
@@ -3983,8 +4491,11 @@ class MainWindow(QMainWindow):
         self.sl_sens.valueChanged.connect(self._on_sens_changed)
         self.sl_tdepth.valueChanged.connect(self._on_tdepth_changed)
         self.spin_minhz.valueChanged.connect(lambda v: self._on_control('min_hz', float(v)))
+        for key, spin in self.detector_controls.items():
+            spin.valueChanged.connect(lambda v, k=key: self._on_control(k, int(v) if k == 'max_outliers' else float(v)))
         self.chk_pass2.toggled.connect(lambda v: self._on_control('second_pass', bool(v)))
-        self.btn_detect.clicked.connect(lambda: self._request_clean(detect=True, delay=0, force=True))
+        self.btn_detect.clicked.connect(lambda: self._request_auto_curves() if self.fs.edit_mode == 'curves'
+                                        else self._request_clean(detect=True, delay=0, force=True))
         self.btn_show_list.toggled.connect(self._on_show_list)
         self.tbl_notches.itemChanged.connect(self._on_notch_item_changed)
         self.btn_notch_add.clicked.connect(lambda: self._add_notch_at(self._default_new_notch_freq()))
@@ -4009,7 +4520,7 @@ class MainWindow(QMainWindow):
             lambda _: self._on_control('stereo', self.combo_stereo.currentData()))
         self.combo_res.currentIndexChanged.connect(self._on_resolution_changed)
 
-        self.slider_vol.valueChanged.connect(lambda v: setattr(self, '_cb_volume', v / 100.0))
+        self.slider_vol.valueChanged.connect(self._on_volume_changed)
         self.btn_play.clicked.connect(self._toggle_play)
         self.btn_stop.clicked.connect(self._stop)
         self.btn_ab.clicked.connect(self._toggle_ab)
@@ -4020,8 +4531,13 @@ class MainWindow(QMainWindow):
 
         self.slider_pos.sliderPressed.connect(self._timeline_pressed)
         self.slider_pos.sliderReleased.connect(self._timeline_released)
+        self.slider_pos.sliderMoved.connect(self._timeline_moved)
 
     # ── Control handlers ─────────────────────────────────────
+
+    def _on_volume_changed(self, value):
+        self._cb_volume = value / 100.0
+        self._settings.setValue('volume', value)
 
     def _on_control(self, name: str, value, detect: bool | None = None):
         if self._updating or getattr(self.fs, name) == value:
@@ -4032,6 +4548,9 @@ class MainWindow(QMainWindow):
             self.fs.preset = 'custom'
             self._show_custom_preset()
         self._save_filter_settings()
+        self._refresh_filter_response()
+        if name in DETECT_FIELDS and name != 'tones_on' and self.fs.edit_mode == 'curves' and self.fs.auto_eq:
+            self._auto_curve_requested = True
         self._request_clean(detect=(name in DETECT_FIELDS) if detect is None else detect)
 
     def _uncheck_preset_buttons(self):
@@ -4048,6 +4567,7 @@ class MainWindow(QMainWindow):
         self.combo_user_presets.setCurrentIndex(0)
         self.combo_user_presets.blockSignals(False)
         self.btn_preset_del.setEnabled(False)
+        self._refresh_quick_presets()
 
     # ── User presets (one JSON file each in presets/) ────────
 
@@ -4069,6 +4589,7 @@ class MainWindow(QMainWindow):
         combo.setCurrentIndex(max(combo.findData(current), 0) if current else 0)
         combo.blockSignals(False)
         self.btn_preset_del.setEnabled(combo.currentIndex() > 0)
+        self._refresh_quick_presets()
 
     @staticmethod
     def _preset_filename(name: str) -> str:
@@ -4146,6 +4667,10 @@ class MainWindow(QMainWindow):
     def _on_preset_clicked(self, button):
         key = next(k for k, b in self.preset_buttons.items() if b is button)
         self.fs.apply_preset(key)
+        if self.fs.edit_mode == 'curves':
+            self.fs.tones_on = False
+            self.fs.auto_eq = True
+            self._auto_curve_requested = True
         self._settings_to_controls()
         self._save_filter_settings()
         self._request_clean(detect=True, delay=0)
@@ -4183,7 +4708,7 @@ class MainWindow(QMainWindow):
     def _update_list_button(self):
         arrow = '▾' if self.btn_show_list.isChecked() else '▸'
         self.btn_show_list.setText(f'{"Hide" if self.btn_show_list.isChecked() else "Show"} '
-                                   f'tone list ({len(self.fs.notches)}) {arrow}')
+                                   f'outlier list ({len(self.fs.notches)})')
 
     def _update_resolution_label(self):
         sr = self.sample_rate
@@ -4195,7 +4720,7 @@ class MainWindow(QMainWindow):
     def _update_export_label(self):
         label = EXPORT_FORMATS.get(self.export_format, EXPORT_FORMATS['wav24'])[0]
         suffix = self.name_suffix or '(none)'
-        self.lbl_export.setText(f'{label} · suffix {suffix} · to output/ · change in Settings menu')
+        self.lbl_export.setText(f'{label} · suffix {suffix} · to output/ · change in Settings > Export')
 
     def _tone_band(self) -> tuple[float, float]:
         lo = max(self.fs.min_hz * 0.8, 1000.0)
@@ -4266,9 +4791,12 @@ class MainWindow(QMainWindow):
         self.spectrum.set_notches(self.fs.notches)
         self.closeup.set_notches(self.fs.notches)
         self.closeup.set_threshold(self.fs.threshold_db)
-        self.tone_view.set_overlay(self.fs.notches, self.fs.shelf_on, self.fs.fade_start, self.fs.cutoff)
+        self.tone_view.set_overlay(self.fs.notches, self.fs.shelf_on and self.fs.edit_mode == 'range',
+                                   self.fs.fade_start, self.fs.cutoff)
+        self._refresh_filter_response()
         self._refresh_notch_table()
         self._update_list_button()
+        self._refresh_outlier_badge()
 
     def _default_new_notch_freq(self) -> float:
         c = self.spectrum.view_center()
@@ -4361,6 +4889,7 @@ class MainWindow(QMainWindow):
                 self.file_list.addItem(item)
                 existing.add(p)
         self.btn_batch.setEnabled(self.file_list.count() > 0)
+        self.lbl_track_count.setText(f'TRACKS \u00b7 {self.file_list.count()}')
 
     def _load_input_folder(self):
         if self.INPUT_DIR.exists():
@@ -4376,6 +4905,9 @@ class MainWindow(QMainWindow):
         if not items:
             return
         path = items[0].data(Qt.ItemDataRole.UserRole)
+        self._save_filter_settings()
+        self._loading_track = True
+        self._update_config_buttons()
         if self._hist_clear == 'track' and self.current_path and path != self.current_path:
             self._forget_track_history(self.current_path)
         self._switch_was_playing = self.is_playing
@@ -4397,6 +4929,8 @@ class MainWindow(QMainWindow):
 
     def _on_load_error(self, msg: str, generation: int):
         if generation == self._load_generation:
+            self._loading_track = False
+            self._update_config_buttons()
             self._set_busy(None)
             self._set_status(f'Could not open the file: {msg}')
 
@@ -4414,23 +4948,28 @@ class MainWindow(QMainWindow):
         self.tone_view.pick_loop = False
         self.sample_rate  = payload['sr']
         self.current_path = payload['path']
+        self.spectrum.set_nyquist(self.sample_rate / 2.0)
+        self._restore_track_config(self.current_path)
+        self._loading_track = False
+        self._update_config_buttons()
         self._cb_frame    = 0
 
+        self._set_track_path(self.current_path)
         dur, n_ch = self.processor.duration, self.processor.n_ch
         self.lbl_track.setText(
-            f"{Path(self.current_path).name}\n{fmt_time(dur)} · {self.sample_rate} Hz · {n_ch} ch · "
+            f"{fmt_time(dur)} · {self.sample_rate} Hz · {n_ch} ch · "
             f"content up to {self.processor.bandwidth / 1000:.1f} kHz")
         self._update_total_time()
         self._update_resolution_label()
 
         self.spectrum.set_nyquist(self.sample_rate / 2.0)
         self.spectrum.plot_original(payload['spec_f'], payload['spec_p'])
-        self._zoom_tone_band()
+        self.spectrum.set_view(*self.spectrum._zoom_xlim_full)
         self.tone_view.set_original(self.processor.tone_view(), self.fs.min_hz - 1000.0,
                                     self.processor.bandwidth + 300.0)
-        self.closeup.set_original(payload['spec_f'], self.processor.tone_prominence(),
+        self.closeup.set_original(payload['spec_f'], self.processor.tone_prominence(self.fs),
                                   max(self.fs.min_hz - 1000.0, 1000.0), self.processor.bandwidth + 300.0)
-        self._on_region_selected(None, None, reprocess=False)
+        self._show_profile_region()
         self._clear_result()
         self._update_loop()
         self._sync_playback()
@@ -4442,15 +4981,9 @@ class MainWindow(QMainWindow):
         self.btn_detect.setEnabled(True)
         self.combo_stereo.setEnabled(n_ch == 2)
 
-        # Keep the last used tone list; only detect when asked to (or nothing was ever found).
-        if self.current_path in self._manual_notches:
-            self._set_notches(self._manual_notches[self.current_path], manual=False, reprocess=False)
-            self._request_clean(detect=False, delay=0)
-        elif self.detect_on_load or not self._have_last_notches:
-            self._request_clean(detect=True, delay=0)
-        else:
-            self._set_notches(self.fs.notches, manual=False, reprocess=False)
-            self._request_clean(detect=False, delay=0)
+        self._set_notches(self.fs.notches, manual=False, reprocess=False)
+        refresh_fixed = self.detect_on_load and self.current_path not in self._manual_notches
+        self._request_clean(detect=not self._track_detected or refresh_fixed, delay=0)
 
         if getattr(self, '_switch_was_playing', False):
             self._play()
@@ -4459,7 +4992,7 @@ class MainWindow(QMainWindow):
 
     def _detect_key(self) -> tuple:
         s = self.fs
-        return (self.current_path, s.threshold_db, s.min_hz, s.second_pass,
+        return (self.current_path, *(getattr(s, k) for k in sorted(DETECT_FIELDS)),
                 s.tone_depth_db if s.second_pass else None, s.method, s.stereo, s.resolution)
 
     def _request_clean(self, detect: bool, delay: int = 350, force: bool = False):
@@ -4477,6 +5010,11 @@ class MainWindow(QMainWindow):
     def _run_clean(self):
         if self._audio_orig is None:
             return
+        if (self.spectrum._curve_drag is not None or
+                any(getattr(control.dial, '_drag', None) is not None
+                    for control in self.rotary_controls.values())):
+            self._clean_debounce.start(150)
+            return
         if self._clean_worker and self._clean_worker.isRunning():
             self._clean_debounce.start(150)
             return
@@ -4491,7 +5029,10 @@ class MainWindow(QMainWindow):
                 self._refresh_notch_views()
                 detect = False
         self._proc_generation += 1
-        self._clean_worker = CleanWorker(self.processor, s, detect, self._proc_generation)
+        self._clean_worker = CleanWorker(self.processor, s, detect, self._proc_generation,
+                                         suggest=self._auto_curve_requested,
+                                         auto_if_empty=not self._track_detected)
+        self._auto_curve_requested = False
         self._clean_worker.progress.connect(self._on_clean_progress)
         self._clean_worker.done.connect(self._on_cleaned)
         self._clean_worker.error.connect(self._on_clean_error)
@@ -4515,6 +5056,14 @@ class MainWindow(QMainWindow):
         proc = payload['audio']
         if proc.shape != self._audio_orig.shape:
             return
+        self._track_detected = True
+        if payload.get('suggested'):
+            self.fs.eq_curves = [dict(c) for c in payload['settings'].eq_curves]
+            self.fs.tones_on = False
+            self.spectrum.select_curve(0 if self.fs.eq_curves else -1)
+            self._settings_to_controls()
+            if not self.fs.eq_curves:
+                self._set_status('No strong narrow outliers found. Add a curve to shape a region manually.')
         if payload['detected']:
             self._detect_cache[self._detect_key()] = [dict(n) for n in payload['notches']]
             self._set_notches(payload['notches'], manual=False, reprocess=False)
@@ -4522,6 +5071,12 @@ class MainWindow(QMainWindow):
         self._hist_generation += 1       # a fresh result beats a version still being prepared
         self._hist_pending = None
         self._set_busy(None)
+        f, _ = self.processor.spectrum_original()
+        self.tone_view.set_original(self.processor.tone_view(self.fs),
+                                    max(self.fs.min_hz - 1000., 20.),
+                                    min(self.fs.max_hz, self.sample_rate / 2.))
+        self.closeup.set_original(f, self.processor.tone_prominence(self.fs),
+                                  max(self.fs.min_hz - 1000., 20.), min(self.fs.max_hz, self.sample_rate / 2.))
         self._update_steps(3)
         self._have_last_notches = True
         self._save_filter_settings()
@@ -4535,8 +5090,12 @@ class MainWindow(QMainWindow):
         parts = []
         if s.tones_on:
             parts.append(f'{sum(1 for n in s.notches if n.get("on", True))} tones notched')
-        if s.shelf_on:
+        if s.shelf_on and s.edit_mode == 'range':
             parts.append(f'top band {s.shelf_depth_db:+.0f} dB from {s.fade_start / 1000:.1f} kHz')
+        if payload.get('suggested') and not s.eq_curves:
+            parts.append('no strong narrow outliers found; use Add curve to shape a region')
+        if s.edit_mode == 'curves' and s.eq_curves:
+            parts.append(f'{sum(c["on"] for c in s.eq_curves)} EQ curves')
         self._update_device_label()
         self._set_status('Done — ' + (', '.join(parts) if parts else 'nothing enabled') +
                          f' ({payload["seconds"]:.1f} s on {payload["device"]}).'
@@ -4558,12 +5117,12 @@ class MainWindow(QMainWindow):
     def _show_result(self, r: dict):
         good, warn, bad = C['proc'], C['res'], C['cut']
         before, after = r['tones_before'], r['tones_after']
-        if r.get('tones_on', self.fs.tones_on):
+        if r.get('tones_on', self.fs.tones_on) or r.get('eq_trace'):
             col = good if after <= max(1, before // 10) else warn if after <= before // 3 else bad
-            self.lbl_tones_big.setText(f'{before} AI tones  →  {after} left')
+            self.lbl_tones_big.setText(f'{before} spectral outliers  →  {after} left')
         else:
             col = C['off']
-            self.lbl_tones_big.setText(f'{before} AI tones (removal off)')
+            self.lbl_tones_big.setText(f'{before} spectral outliers (removal off)')
         self.lbl_tones_big.setStyleSheet(f'color: {col};')
 
         pct = r['energy_pct']
@@ -4632,6 +5191,8 @@ class MainWindow(QMainWindow):
         return 'Custom'
 
     def _fmt_value(self, k: str, v) -> str:
+        if k == 'eq_curves':
+            return f'{len(v or [])} bands'
         if v is None:
             return 'whole track' if k == 'profile_region' else '—'
         if isinstance(v, bool):
@@ -4851,7 +5412,7 @@ class MainWindow(QMainWindow):
     # ── Rendered versions (session temp folder) ─────────────
 
     def _result_of(self, payload: dict) -> dict:
-        r = {k: payload[k] for k in self._RESULT_KEYS}
+        r = {k: payload.get(k) for k in self._RESULT_KEYS}
         r['tones_on'] = bool(payload['settings'].tones_on)
         return r
 
@@ -5070,6 +5631,8 @@ class MainWindow(QMainWindow):
         self.btn_ab.setObjectName(obj)
         self.style().unpolish(self.btn_ab)
         self.style().polish(self.btn_ab)
+        self.btn_ab.setAccessibleName('Compare audio: ' + label)
+        self._update_analysis_position()
 
     # ── Audio callback ────────────────────────────────────────
 
@@ -5125,7 +5688,7 @@ class MainWindow(QMainWindow):
             self._cb_loop = (0, orig.shape[0])
         self.tone_view.set_loop(r)
         armed = self.tone_view.pick_loop
-        self.btn_loop_sec.setText('Clear Section' if r else 'Pick a section …' if armed else 'Loop Section')
+        self.btn_loop_sec.setText('Clear' if r else 'Pick a section …' if armed else 'Section')
         self.lbl_loop.setText(f'{fmt_time(r[0], True)} – {fmt_time(r[1], True)}' if r else '')
 
     def _on_loop_toggled(self, on: bool):
@@ -5144,7 +5707,7 @@ class MainWindow(QMainWindow):
             self.tone_view.pick_loop = True
             self.btn_view_lines.setChecked(True)
             self.lower_stack.setCurrentIndex(1)
-            self._set_status('Drag across the Tone lines view to pick the section to loop.')
+            self._set_status('Drag across the spectrogram to pick the section to loop.')
         self._update_loop()
 
     def _on_loop_selected(self, t0: float, t1: float):
@@ -5182,7 +5745,10 @@ class MainWindow(QMainWindow):
 
     def _show_play_state(self, playing: bool):
         self.btn_play.setIcon(self._icon_pause if playing else self._icon_play)
-        self.btn_play.setText(' Pause' if playing else ' Play')
+        self.btn_play.setText('')
+        self.btn_play.setAccessibleName('Pause' if playing else 'Play')
+        self.btn_play.setToolTip('Pause (Space)' if playing else 'Play (Space)')
+        self.btn_play.setStyleSheet('background:#505050; border:2px solid #dddddd;' if playing else '')
 
     def _close_stream(self):
         if self._stream is not None:
@@ -5200,6 +5766,9 @@ class MainWindow(QMainWindow):
             self._play()
 
     def _play(self):
+        if self._audio_orig is not None and self._cb_frame >= len(self._audio_orig) - 1:
+            self._cb_frame = 0
+            self.spectrum.prepare_seek()
         self._open_stream()
 
     def _pause(self):
@@ -5207,6 +5776,7 @@ class MainWindow(QMainWindow):
         self._pos_timer.stop()
         self.is_playing = False
         self._show_play_state(False)
+        self._update_live_spectrum()
 
     def _stop(self):
         self._close_stream()
@@ -5217,6 +5787,8 @@ class MainWindow(QMainWindow):
         self.slider_pos.setValue(0)
         self._update_time_labels(0.0)
         self.tone_view.set_playhead(0.0)
+        self.spectrum.prepare_seek()
+        self._update_live_spectrum()
 
     def _toggle_ab(self):
         """Step A → B → C … → A. If solo is active, Tab exits solo first. Stream keeps running."""
@@ -5238,14 +5810,16 @@ class MainWindow(QMainWindow):
         self._update_view_mode()
 
     def _update_view_mode(self):
-        """Frame colour + tone view follow what you are hearing."""
+        """Analyzer and detail views follow the audition source."""
         mode = ('res' if self._solo_residual else 'orig' if self._slot == 0 else
                 'proc' if self._slot == 1 else 'cmp')
-        self.view_frame.setStyleSheet(
-            f'QFrame#view_frame {{ border: 2px solid {self._MODE_COLORS[mode]}; border-radius: 8px; }}')
         self.tone_view.set_view('proc' if mode == 'cmp' else mode)
+        self._update_analysis_position()
         if self._audio_proc is not None:
             self._update_steps(4)
+        if hasattr(self, 'spectrum'):
+            self.spectrum.prepare_seek()
+            self._update_live_spectrum()
 
     # ── Pan slider sync ───────────────────────────────────────
 
@@ -5301,36 +5875,78 @@ class MainWindow(QMainWindow):
         self._update_slider_from_frame()
         self._update_time_labels(frame / self.sample_rate)
         self.tone_view.set_playhead(frame / self.sample_rate)
+        self.spectrum.prepare_seek()
+        self._update_live_spectrum()
         if was_playing:
             self._open_stream()
 
     def _timeline_pressed(self):
         self._scrub_was_playing = self.is_playing
+        self.spectrum.prepare_seek()
         if self.is_playing:
             self._close_stream()
             self._pos_timer.stop()
             self.is_playing = False
             self._show_play_state(False)
+        self._timeline_moved(self.slider_pos.value())
+
+    def _timeline_moved(self, value):
+        if self._audio_orig is None:
+            return
+        self._cb_frame = min(len(self._audio_orig) - 1, int(len(self._audio_orig) * value / 10000.))
+        self.spectrum.prepare_seek()
+        self._update_time_labels(self._cb_frame / self.sample_rate)
+        self.tone_view.set_playhead(self._cb_frame / self.sample_rate)
+        self._update_live_spectrum()
 
     def _timeline_released(self):
         if self._audio_orig is None:
             return
-        frame = int(self._audio_orig.shape[0] * self.slider_pos.value() / 10000.0)
+        frame = min(len(self._audio_orig) - 1, int(self._audio_orig.shape[0] * self.slider_pos.value() / 10000.0))
         self._cb_frame = frame
         self._update_time_labels(frame / self.sample_rate)
         self.tone_view.set_playhead(frame / self.sample_rate)
+        self.spectrum.prepare_seek()
+        self._update_live_spectrum()
         if getattr(self, '_scrub_was_playing', False):
             self._open_stream()
 
     def _poll_position(self):
         if not self._cb_playing:
-            self._stop()
+            self._pause()
+            self._update_slider_from_frame()
+            self._update_time_labels(self._cb_frame / self.sample_rate)
             return
         if not self.slider_pos.isSliderDown():
             self._update_slider_from_frame()
         t = self._cb_frame / self.sample_rate
         self._update_time_labels(t)
-        self.tone_view.set_playhead(t)
+        if self.tone_view.isVisible():
+            self.tone_view.set_playhead(t)
+        if self.spectrum.isVisible() or self.closeup.isVisible():
+            self._update_live_spectrum()
+
+    def _update_live_spectrum(self):
+        if self._audio_orig is None or not hasattr(self, 'spectrum'):
+            return
+        audio = self._audio_play if self._audio_play is not None else self._audio_orig
+        residual = None
+        boost = 1.
+        if self._solo_residual and self._audio_solo is not None:
+            audio, residual, boost = self._audio_orig, self._audio_solo, self._solo_boost
+        if self.closeup.isVisible():
+            self.closeup.update_frame(audio, self.sample_rate, self._cb_frame, self.fs.floor_hz, residual, boost)
+            return
+        result = self._shown_result()
+        trace = result.get('eq_trace') if result else None
+        if trace and trace.get('curves') == self.fs.eq_curves:
+            snapshot = response_at(trace, self._cb_frame)
+            if snapshot:
+                self.spectrum.set_instant_response(*snapshot[:2])
+        else:
+            self.spectrum.set_instant_response(None, None)
+        self.spectrum.update_frame(audio, self.sample_rate, self._cb_frame,
+                                    self.is_playing and not self.slider_pos.isSliderDown(), residual, boost)
 
     def _update_slider_from_frame(self):
         if self._audio_orig is None or self.slider_pos.isSliderDown():
@@ -5342,6 +5958,7 @@ class MainWindow(QMainWindow):
     def _update_time_labels(self, cur: float):
         self.lbl_time_cur.setText(fmt_time(cur))
         self._update_total_time()
+        self._update_analysis_position()
 
     def _update_total_time(self):
         orig = self._audio_orig
@@ -5419,6 +6036,8 @@ class MainWindow(QMainWindow):
         s = self.fs.copy()
         if kind == 'strength':
             s.apply_preset(key)
+            if s.edit_mode == 'curves':
+                s.tones_on = False
         elif kind == 'user' and key in self._user_preset_map:
             loaded = FilterSettings.from_dict(
                 {k: v for k, v in self._user_preset_map[key][1].items()
@@ -5462,8 +6081,13 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def closeEvent(self, event):
+        self._pos_timer.stop()
+        self._clean_debounce.stop()
+        self.spectrum._decay_timer.stop()
         self._close_stream()
         self._save_filter_settings()
+        self._settings.setValue('sidebar_width', self._tracks_width if self._tracks_collapsed else self.tracks_panel.width())
+        self._settings.sync()
         for w in [self._load_worker, self._clean_worker, self._batch_worker, self._hist_worker,
                   *self._old_workers]:
             if w and w.isRunning():
@@ -5475,6 +6099,10 @@ class MainWindow(QMainWindow):
             shutil.rmtree(self._vdir, ignore_errors=True)
         elif self._hist_clear == 'track' and self.current_path:
             self._forget_track_history(self.current_path)
+        # Matplotlib queues zero-delay draws outside Qt's QObject timer ownership.
+        # Cancel them before the native canvas children can be destroyed.
+        for canvas in (self.spectrum, self.closeup, self.tone_view):
+            canvas._draw_pending = False
         super().closeEvent(event)
 
 
